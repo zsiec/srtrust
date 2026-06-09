@@ -218,16 +218,19 @@ async fn receive_rate_tracks_the_stream_not_burst_speed() {
     let stats = server.stats().await.expect("stats");
     caller.await.unwrap();
 
-    // ~500 pkt/s: the windowed estimate lands in the right ballpark — emphatically
-    // not the five-figure burst rate the old inter-arrival-median produced.
+    // The windowed estimate lands in the right order of magnitude for the stream —
+    // emphatically not the five-figure burst rate the old inter-arrival-median
+    // produced. The band is deliberately wide: `tokio::time::sleep` granularity
+    // varies by host (macOS rounds up well past 2 ms), so the realized pace ranges
+    // from ~100 to ~500 pkt/s — but never the tens of thousands of the old bug.
     let pps = stats.recv_rate_pps;
     assert!(
-        (150..=1_500).contains(&pps),
-        "recv_rate_pps={pps} should track the ~500 pkt/s stream, not burst speed"
+        (20..=5_000).contains(&pps),
+        "recv_rate_pps={pps} should track the stream pace, not burst speed"
     );
     assert!(
-        stats.recv_rate_bps > 50_000,
-        "recv_rate_bps={} implausibly low for a ~500 pkt/s stream",
+        stats.recv_rate_bps > 10_000,
+        "recv_rate_bps={} implausibly low for a steady stream",
         stats.recv_rate_bps
     );
 }

@@ -23,6 +23,10 @@ pub struct Stats {
     pub bytes_received: u64,
     /// Data packets dropped too-late at the receiver (TLPKTDROP / DROPREQ).
     pub packets_dropped: u64,
+    /// Data packets the *sender* shed unacknowledged because they aged past the
+    /// latency budget (send-side TLPKTDROP; libsrt's `sndDropTotal`). Nonzero
+    /// means the application submitted data the path could not deliver in time.
+    pub packets_dropped_sent: u64,
     /// Received packets discarded as duplicates or already-acknowledged.
     pub packets_duplicate: u64,
     /// Received encrypted packets that could not be decrypted (wrong/absent key,

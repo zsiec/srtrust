@@ -19,6 +19,15 @@ use crate::control::{ControlBody, ControlType};
 use crate::crypto::SessionKeys;
 use crate::crypto::key_material::KeyMaterial;
 
+/// Most times an unconfirmed rekey KMREQ is re-announced (one per keepalive
+/// period, ~1 s) before giving up. Control packets are not ARQ-protected, so
+/// the KMREQ/KMRSP exchange supplies its own reliability (libsrt re-sends until
+/// the SND KM state is `SRT_KM_S_SECURED`; srtgo retries on a 1.5×SRTT timer up
+/// to `SRT_MAX_KMRETRY`). On giving up the pending key is discarded — the
+/// connection keeps the old, still-shared key, and the refresh schedule will
+/// announce a fresh one.
+const MAX_KM_RETRIES: u32 = 60;
+
 impl Connection {
     /// Packets sent under one key before rotating (resolved default).
     fn km_refresh(&self) -> u32 {
@@ -36,14 +45,17 @@ impl Connection {
     }
 
     /// Accounts one encrypted data send and drives rotation: switch to the
-    /// freshly-installed key at the refresh point, and pre-announce the next key
-    /// (via [`Event::KeyRefreshNeeded`]) a quarter-window earlier.
+    /// freshly-installed key at the refresh point — but only once the peer's
+    /// KMRSP has confirmed it holds that key (a late rotation is strictly better
+    /// than an undecryptable stream) — and pre-announce the next key (via
+    /// [`Event::KeyRefreshNeeded`]) a quarter-window earlier.
     pub(super) fn account_key_and_maybe_rotate(&mut self) {
         if self.crypto.is_none() {
             return;
         }
         let refresh = self.km_refresh();
         // Switch first so packets at/after the refresh point use the new key.
+        // `next_key_ready` is set by the peer's KMRSP, never just locally.
         if self.next_key_ready && self.packets_on_key >= refresh {
             if let Some(crypto) = &mut self.crypto {
                 let next = crypto.next_flags();
@@ -56,6 +68,7 @@ impl Connection {
         let announce_at = refresh.saturating_sub(self.km_preannounce());
         if !self.rekey_pending
             && !self.next_key_ready
+            && self.pending_km.is_none()
             && self.packets_on_key >= announce_at
             && let Some(enc) = &self.config.encryption
         {
@@ -95,10 +108,45 @@ impl Connection {
             km.encode(&mut buf);
             buf.freeze()
         };
-        let bytes = self.km_control(EXT_KMREQ, km_bytes, now);
+        let bytes = self.km_control(EXT_KMREQ, km_bytes.clone(), now);
         self.emit(bytes, now);
         self.rekey_pending = false;
-        self.next_key_ready = true;
+        // Announced, *not* confirmed: keep the bytes for re-sends and for
+        // matching the peer's echoed KMRSP. `next_key_ready` is only set by
+        // [`on_km_rsp`](Connection::on_km_rsp).
+        self.pending_km = Some(km_bytes);
+        self.km_retries = 0;
+    }
+
+    /// Handles the peer's rekey KMRSP: it echoes our announced Key Material
+    /// verbatim, proving the peer installed the key — only now may the rotation
+    /// switch to it. A KMRSP that matches nothing pending is ignored.
+    pub(super) fn on_km_rsp(&mut self, cif: &[u8]) {
+        if self
+            .pending_km
+            .as_ref()
+            .is_some_and(|km| km.as_ref() == cif)
+        {
+            self.pending_km = None;
+            self.next_key_ready = true;
+        }
+    }
+
+    /// Re-announces an unconfirmed rekey KMREQ (driven by the ~1 s keepalive
+    /// timer). Control packets are not ARQ-protected, so this re-send loop is
+    /// the rekey exchange's reliability; it stops at the peer's KMRSP or after
+    /// [`MAX_KM_RETRIES`] (giving up keeps the old, still-shared key).
+    pub(super) fn resend_pending_km(&mut self, now: Instant) {
+        let Some(km) = self.pending_km.clone() else {
+            return;
+        };
+        if self.km_retries >= MAX_KM_RETRIES {
+            self.pending_km = None; // give up; the refresh schedule re-announces
+            return;
+        }
+        self.km_retries += 1;
+        let bytes = self.km_control(EXT_KMREQ, km, now);
+        self.emit(bytes, now);
     }
 
     /// Handles an incoming rekey KMREQ: install the announced key in its slot

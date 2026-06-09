@@ -77,6 +77,14 @@ pub fn encode(ranges: &[LossRange], out: &mut BytesMut) {
 
 /// Decodes a loss list from `buf`.
 ///
+/// The in-memory form is **canonical**: a crafted 2-word wire range whose start
+/// equals its end decodes to the same value as the 1-word single form
+/// (`LossRange::new(s, s) == LossRange::single(s)`), so re-encoding emits the
+/// single-word shape. Re-encoding such crafted input therefore does not
+/// reproduce its bytes — deliberately; `decode(encode(decode(x))) ==
+/// decode(x)` always holds, and libsrt never emits the 2-word shape for a
+/// single loss (docs/known-issues/05 §5d).
+///
 /// # Errors
 ///
 /// Returns [`LossListError::Misaligned`] if `buf` is not a multiple of 4 bytes,
@@ -169,6 +177,28 @@ mod tests {
         assert!(buf.is_empty());
         assert_eq!(decode(&buf).unwrap(), Vec::new());
     }
+
+    /// 5d (docs/known-issues/05): a crafted 2-word wire range with
+    /// `start == end` decodes to the canonical single value and re-encodes in
+    /// the canonical 1-word shape — semantically stable, deliberately not
+    /// byte-identical to the crafted input.
+    #[test]
+    fn a_two_word_range_with_equal_ends_canonicalizes() {
+        let mut crafted = BytesMut::new();
+        crafted.put_u32(RANGE_FLAG | 7);
+        crafted.put_u32(7);
+        let decoded = decode(&crafted).unwrap();
+        assert_eq!(decoded, vec![LossRange::single(seq(7))]);
+
+        let mut reencoded = BytesMut::new();
+        encode(&decoded, &mut reencoded);
+        assert_eq!(reencoded.len(), 4, "canonical single-word form");
+        assert_eq!(
+            decode(&reencoded).unwrap(),
+            decoded,
+            "decode∘encode∘decode is stable"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +235,23 @@ mod proptests {
         fn decode_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..2000)) {
             if let Ok(ranges) = decode(&bytes) {
                 prop_assert!(ranges.len() <= bytes.len() / 4);
+            }
+        }
+    }
+
+    proptest! {
+        // Any decodable wire bytes are *semantically* stable through re-encode:
+        // the canonical in-memory form survives, even when the original used
+        // the non-canonical 2-word shape for a single loss (5d).
+        #[test]
+        fn wire_decode_reencode_is_semantically_stable(
+            bytes in prop::collection::vec(any::<u8>(), 0..256)
+        ) {
+            if let Ok(decoded) = decode(&bytes) {
+                let mut reencoded = BytesMut::new();
+                encode(&decoded, &mut reencoded);
+                let redecoded = decode(&reencoded).expect("our own encoding decodes");
+                prop_assert_eq!(redecoded, decoded);
             }
         }
     }

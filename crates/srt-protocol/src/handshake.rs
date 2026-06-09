@@ -565,4 +565,22 @@ mod proptests {
             prop_assert_eq!(decoded, hs);
         }
     }
+
+    proptest! {
+        // The no-panic invariant, fed directly to this module's decoder (5e in
+        // docs/known-issues/05): arbitrary CIF bytes return `Err` at worst,
+        // never panic — including the nested extension walk.
+        #[test]
+        fn decode_never_panics(cif in prop::collection::vec(any::<u8>(), 0..512)) {
+            let _ = Handshake::decode(&cif);
+        }
+    }
+
+    proptest! {
+        // Same invariant for the Stream ID extension decoder.
+        #[test]
+        fn decode_stream_id_never_panics(content in prop::collection::vec(any::<u8>(), 0..128)) {
+            let _ = decode_stream_id(&content);
+        }
+    }
 }

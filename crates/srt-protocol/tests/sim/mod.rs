@@ -102,7 +102,14 @@ pub struct Link {
     pending: Vec<(u64, u64, Bytes)>,
     next_seq: u64,
     dropped: u64,
+    /// Optional deterministic drop predicate, consulted before the probabilistic
+    /// loss roll; `true` drops the datagram. Lets a test target a *specific*
+    /// packet ("the first transmission of seq N") instead of hunting for a seed.
+    drop_filter: Option<DropFilter>,
 }
+
+/// A deterministic per-datagram drop predicate (`true` = drop).
+pub type DropFilter = Box<dyn FnMut(&[u8]) -> bool>;
 
 impl Link {
     /// Creates a link with the given impairments, its PRNG seeded by `seed`.
@@ -114,6 +121,7 @@ impl Link {
             pending: Vec::new(),
             next_seq: 0,
             dropped: 0,
+            drop_filter: None,
         }
     }
 
@@ -124,6 +132,12 @@ impl Link {
     /// depends only on its position in the stream — not on whether jitter is
     /// enabled — which keeps loss patterns stable as other knobs change.
     pub fn send(&mut self, now_us: u64, payload: Bytes) {
+        if let Some(filter) = &mut self.drop_filter
+            && filter(&payload)
+        {
+            self.dropped += 1;
+            return;
+        }
         let lost = self.cfg.loss > 0.0 && self.rng.next_unit() < self.cfg.loss;
         if lost {
             self.dropped += 1;
@@ -322,6 +336,20 @@ impl Pair {
     pub fn degrade_links(&mut self, c2l: LinkConfig, l2c: LinkConfig, seed: u64) {
         self.c2l = Link::new(c2l, seed);
         self.l2c = Link::new(l2c, seed ^ 0xFFFF_FFFF_FFFF_FFFF);
+    }
+
+    /// Installs a deterministic drop predicate on the caller→listener direction:
+    /// every datagram for which `filter` returns `true` is dropped. Targets a
+    /// specific packet (by decoding the datagram) without touching the seeded
+    /// probabilistic loss.
+    pub fn set_c2l_drop_filter(&mut self, filter: impl FnMut(&[u8]) -> bool + 'static) {
+        self.c2l.drop_filter = Some(Box::new(filter));
+    }
+
+    /// Like [`set_c2l_drop_filter`](Pair::set_c2l_drop_filter), for the
+    /// listener→caller direction.
+    pub fn set_l2c_drop_filter(&mut self, filter: impl FnMut(&[u8]) -> bool + 'static) {
+        self.l2c.drop_filter = Some(Box::new(filter));
     }
 
     /// Drains all currently-queued outputs/events from every endpoint into the
@@ -527,6 +555,13 @@ impl Pair {
     #[must_use]
     pub fn caller_stats(&self) -> Stats {
         self.caller.stats()
+    }
+
+    /// Whether the caller's send window has room (the I/O layer's backpressure
+    /// signal).
+    #[must_use]
+    pub fn caller_send_window_available(&self) -> bool {
+        self.caller.send_window_available()
     }
 
     /// The accepted side's connection statistics (once it exists).

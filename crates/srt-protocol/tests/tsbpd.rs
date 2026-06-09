@@ -82,6 +82,56 @@ fn delivery_is_held_until_the_play_time() {
     );
 }
 
+/// BUG-03 (docs/known-issues/03): packet timestamps are 32-bit microseconds, and
+/// a single circular diff against the frozen first-packet anchor is only
+/// unambiguous within ±2^31 µs (~35.8 min). Past that, the computed play time
+/// lands in the past and TSBPD degenerates into deliver-immediately. The time
+/// base must advance across the wrap (spec §4.5.1.1 case 1). The stream here is
+/// continuous (a packet every 10 s), as live streams are — wrap tracking keys
+/// on the data stream itself.
+#[test]
+fn delivery_is_still_held_after_the_timestamp_wrap_window() {
+    let latency_ms = 200;
+    let mut pair = connected(LinkConfig::PERFECT, LinkConfig::PERFECT, 11, latency_ms);
+
+    // Stream one packet every 10 fake seconds until sender timestamps are well
+    // past anchor + 2^31 µs (~35.8 min → 220 packets ≈ 36.7 min).
+    let across = 220u32;
+    for i in 0..across {
+        pair.caller_send(&payload(u8::try_from(i % 200).expect("fits")));
+        pair.run_for(10_000_000);
+    }
+    assert_eq!(
+        pair.accepted_received().len(),
+        across as usize,
+        "the steady stream is delivered throughout"
+    );
+
+    // A packet sent now — past the ±2^31 µs window from the anchor — must still
+    // be held for `latency`, not played out immediately.
+    let sent_at = pair.fake_micros();
+    assert!(
+        sent_at > (1 << 31),
+        "the test must actually cross the wrap window, at {sent_at} us"
+    );
+    pair.caller_send(&payload(255));
+    pair.run_for(100_000); // 100 ms < the 200 ms latency
+    assert_eq!(
+        pair.accepted_received().len(),
+        across as usize,
+        "a packet sent past the wrap window must still be held for `latency`"
+    );
+    assert!(pair.run_until(
+        |p| p.accepted_received().len() == across as usize + 1,
+        20_000
+    ));
+    let elapsed = pair.fake_micros() - sent_at;
+    assert!(
+        (200_000..=230_000).contains(&elapsed),
+        "played ~latency after send even across the wrap, got {elapsed} us"
+    );
+}
+
 #[test]
 fn clean_link_delivers_everything_in_order() {
     let mut pair = connected(LinkConfig::PERFECT, LinkConfig::PERFECT, 3, 100);

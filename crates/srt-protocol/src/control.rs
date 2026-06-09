@@ -620,4 +620,19 @@ mod proptests {
             prop_assert_eq!(decoded, pkt);
         }
     }
+
+    proptest! {
+        // The no-panic invariant, fed directly to this module's decoder (5e in
+        // docs/known-issues/05): arbitrary header words and CIF bytes return
+        // `Err` at worst, never panic.
+        #[test]
+        fn decode_never_panics(
+            raw_type: u16,
+            subtype: u16,
+            type_specific: u32,
+            cif in prop::collection::vec(any::<u8>(), 0..512),
+        ) {
+            let _ = ControlBody::decode(raw_type, subtype, type_specific, &cif);
+        }
+    }
 }

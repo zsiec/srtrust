@@ -88,10 +88,16 @@ pub async fn connect_with<R: Runtime>(
 }
 
 /// A listening SRT endpoint that accepts incoming connections.
+///
+/// Dropping the listener shuts its background driver down and releases the UDP
+/// socket. Connections already accepted (and their `SrtStream`s) are
+/// independent and keep running.
 #[derive(Debug)]
 pub struct SrtListener {
     accept_rx: mpsc::Receiver<driver::Accepted>,
     local_addr: SocketAddr,
+    /// Held only so its drop resolves the driver's shutdown future.
+    _shutdown: oneshot::Sender<()>,
 }
 
 impl SrtListener {
@@ -127,14 +133,16 @@ impl SrtListener {
         );
 
         let (accept_tx, accept_rx) = mpsc::channel(driver::COMMAND_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver_runtime = runtime.clone();
         runtime.spawn(Box::pin(async move {
-            drive_endpoint(driver_runtime, socket, listener, accept_tx).await;
+            drive_endpoint(driver_runtime, socket, listener, accept_tx, shutdown_rx).await;
         }));
 
         Ok(SrtListener {
             accept_rx,
             local_addr,
+            _shutdown: shutdown_tx,
         })
     }
 

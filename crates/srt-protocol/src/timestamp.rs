@@ -73,6 +73,127 @@ impl Timestamp {
     }
 }
 
+/// Unwraps the 32-bit wrapping packet-timestamp stream into a monotonic 64-bit
+/// microsecond offset, so TSBPD survives past the ±2^31 µs (~35.8 min) window
+/// that a single circular diff can resolve (spec §4.5.1.1 case 1: the TSBPD
+/// time base advances by `MAX_TIMESTAMP + 1` at each wrap).
+///
+/// [`observe`](TsbpdWrap::observe) feeds it every accepted packet timestamp; a
+/// wrap is detected only when a timestamp is circularly *newer* than the newest
+/// seen yet numerically smaller — mere reordering (retransmissions, stragglers
+/// from before the wrap) is circularly *older* and never advances the state.
+/// [`offset_of`](TsbpdWrap::offset_of) is pure: stragglers from the previous
+/// period still resolve to their original offsets.
+///
+/// **Limitation (inherent, shared with libsrt):** each forward step must be
+/// less than 2^31 µs. A connection that carries *no data at all* for more than
+/// ~35.8 minutes cannot disambiguate the next timestamp — circularly, a jump of
+/// `2^31 + d` is indistinguishable from going backward `2^31 - d`. Live streams
+/// carry continuous data, so this never arises in SRT's target use.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TsbpdWrap {
+    /// Microseconds contributed by completed wrap periods (multiples of 2^32).
+    base: u64,
+    /// The circularly-newest timestamp seen within the current period.
+    last: Timestamp,
+}
+
+impl TsbpdWrap {
+    /// Starts tracking from the first accepted packet's timestamp.
+    pub(crate) const fn new(first: Timestamp) -> Self {
+        TsbpdWrap {
+            base: 0,
+            last: first,
+        }
+    }
+
+    /// Feeds one accepted packet timestamp, advancing the period state when the
+    /// stream crosses the numeric wrap.
+    pub(crate) const fn observe(&mut self, ts: Timestamp) {
+        if ts.wrapping_diff(self.last) > 0 {
+            // Circularly newer. Numerically smaller means the stream crossed the
+            // numeric wrap: one more completed 2^32 µs period.
+            if ts.as_micros() < self.last.as_micros() {
+                self.base += 1 << 32;
+            }
+            self.last = ts;
+        }
+        // Circularly older (a retransmission or reordered straggler): ignore —
+        // this is the guard the naive "ts < last ⇒ wrap" check lacks.
+    }
+
+    /// The monotonic microsecond offset of `ts` from the first period's origin.
+    /// Resolves `ts` circularly against the newest seen timestamp, so values up
+    /// to ±2^31 µs around it — including stragglers from the previous period —
+    /// land in the right period.
+    #[allow(clippy::cast_possible_wrap)] // `base` stays far below 2^63
+    pub(crate) fn offset_of(&self, ts: Timestamp) -> i64 {
+        self.base as i64 + i64::from(self.last.as_micros()) + i64::from(ts.wrapping_diff(self.last))
+    }
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+
+    #[test]
+    fn offsets_are_monotonic_across_the_wrap() {
+        // Steps must each stay under 2^31 µs (a live stream's always do).
+        let mut w = TsbpdWrap::new(Timestamp::from_micros(1000));
+        assert_eq!(w.offset_of(Timestamp::from_micros(1000)), 1000);
+        w.observe(Timestamp::from_micros(0x7000_0000));
+        w.observe(Timestamp::from_micros(0xE000_0000));
+        assert_eq!(
+            w.offset_of(Timestamp::from_micros(0xE000_0000)),
+            0xE000_0000
+        );
+        // 50 is circularly *newer* than 0xE000_0000: the stream wrapped.
+        w.observe(Timestamp::from_micros(50));
+        assert_eq!(w.offset_of(Timestamp::from_micros(50)), (1i64 << 32) + 50);
+    }
+
+    #[test]
+    fn a_straggler_from_the_previous_period_keeps_its_old_offset() {
+        let mut w = TsbpdWrap::new(Timestamp::from_micros(0xFFFF_0000));
+        w.observe(Timestamp::from_micros(100)); // wrapped
+        assert_eq!(w.offset_of(Timestamp::from_micros(100)), (1i64 << 32) + 100);
+        // A late retransmission stamped before the wrap resolves into the old
+        // period…
+        assert_eq!(
+            w.offset_of(Timestamp::from_micros(0xFFFF_8000)),
+            0xFFFF_8000
+        );
+        // …and observing it must not advance (or rewind) the wrap state.
+        w.observe(Timestamp::from_micros(0xFFFF_8000));
+        assert_eq!(w.offset_of(Timestamp::from_micros(200)), (1i64 << 32) + 200);
+    }
+
+    #[test]
+    fn reordering_near_the_wrap_does_not_double_count() {
+        let mut w = TsbpdWrap::new(Timestamp::from_micros(0xFFFF_FF00));
+        w.observe(Timestamp::from_micros(10)); // wraps once
+        w.observe(Timestamp::from_micros(0xFFFF_FFF0)); // straggler: ignored
+        w.observe(Timestamp::from_micros(20)); // same period: no second wrap
+        assert_eq!(w.offset_of(Timestamp::from_micros(20)), (1i64 << 32) + 20);
+    }
+
+    #[test]
+    fn two_full_periods_accumulate() {
+        let mut w = TsbpdWrap::new(Timestamp::from_micros(0));
+        for _ in 0..2 {
+            // Sub-2^31 steps around one full period.
+            w.observe(Timestamp::from_micros(0x6000_0000));
+            w.observe(Timestamp::from_micros(0xB000_0000));
+            w.observe(Timestamp::from_micros(0xFFFF_0000));
+            w.observe(Timestamp::from_micros(0x10)); // wraps
+        }
+        assert_eq!(
+            w.offset_of(Timestamp::from_micros(0x10)),
+            (2i64 << 32) + 0x10
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

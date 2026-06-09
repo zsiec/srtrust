@@ -12,6 +12,15 @@ use srt::{Config, SrtListener, connect};
 
 fn paced_config() -> Config {
     Config {
+        // A deliberately slow pace (~2 Mbps) so the queue cannot drain quickly —
+        // the app will outrun it and must be held back.
+        max_bw: 250_000,
+        ..unpaced_config()
+    }
+}
+
+fn unpaced_config() -> Config {
+    Config {
         latency: Duration::from_millis(120),
         mtu: 1500,
         // A tiny flow window: at most this many packets may be unacknowledged or
@@ -19,12 +28,53 @@ fn paced_config() -> Config {
         flow_window: 16,
         stream_id: None,
         encryption: None,
-        // A deliberately slow pace (~2 Mbps) so the queue cannot drain quickly —
-        // the app will outrun it and must be held back.
-        max_bw: 250_000,
+        max_bw: 0, // the default: no pacing
         km_refresh_rate: 0,
         fec: None,
     }
+}
+
+/// BUG-04 (docs/known-issues/04): the **default** config (`max_bw = 0`) bypasses
+/// the pacer queue, which used to be the only thing `send_window_available`
+/// measured — so a stalled peer let `send` absorb data without limit, silently
+/// shed later by send-side TLPKTDROP. Backpressure must bound the in-flight
+/// backlog in every config: the flow window covers sent-but-unacknowledged
+/// packets, and the peer's advertised receive-buffer availability (spec §3.2.4)
+/// closes the window while a stalled receiver sits on undelivered data.
+#[tokio::test]
+async fn unpaced_default_config_backpressures_on_a_stalled_receiver() {
+    let mut listener = SrtListener::bind("127.0.0.1:0".parse().unwrap(), unpaced_config()).unwrap();
+    let addr = listener.local_addr();
+
+    let stream = connect("127.0.0.1:0".parse().unwrap(), addr, unpaced_config())
+        .await
+        .expect("connect");
+    // Accept, then never read: the receiver stalls completely.
+    let _server = listener.accept().await.expect("accept");
+
+    let completed = Arc::new(AtomicU64::new(0));
+    let flooder_completed = completed.clone();
+    let flooder = tokio::spawn(async move {
+        let payload = Bytes::from(vec![0xAB; 1316]);
+        loop {
+            if stream.send(payload.clone()).await.is_err() {
+                break;
+            }
+            flooder_completed.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    flooder.abort();
+
+    let count = completed.load(Ordering::Relaxed);
+    // Bounded by the windows and channel capacities, not by machine speed — a
+    // few hundred at most. Without the gate, tens of thousands sail through.
+    assert!(
+        count < 1000,
+        "the default config must backpressure a stalled receiver, got {count}"
+    );
+    assert!(count > 0, "the sender made progress, got {count}");
 }
 
 #[tokio::test]

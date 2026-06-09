@@ -28,7 +28,7 @@ use crate::loss_list::LossRange;
 use crate::packet::{DataPacket, Encryption, MsgNumber, Packet, PacketPosition};
 use crate::recv_buffer::RecvBuffer;
 use crate::seq::SeqNumber;
-use crate::timestamp::Timestamp;
+use crate::timestamp::{Timestamp, TsbpdWrap};
 
 /// Period of the full acknowledgement timer (libsrt's ACK interval).
 const ACK_INTERVAL: Duration = Duration::from_millis(10);
@@ -48,11 +48,15 @@ const MAX_PACE_BURST: usize = 256;
 /// How long the connection may be silent before it must send a KEEPALIVE (spec
 /// §3.2.6; libsrt's keepalive period is 1 s).
 const KEEPALIVE_PERIOD: Duration = Duration::from_secs(1);
-/// Reorder tolerance: a gap is not NAK'd until this many packets have arrived past
-/// it, so a packet merely reordered in flight is not mistaken for a loss (libsrt's
-/// `SRTO_LOSSMAXTTL`). Trades a little recovery latency for far fewer spurious NAKs
-/// on a jittery link.
-const REORDER_TOLERANCE: u32 = 5;
+/// Cap on the adaptive reorder tolerance (libsrt's `SRTO_LOSSMAXTTL` role): a
+/// gap is not NAK'd until `Connection::reorder_tolerance` packets have arrived
+/// past it, and that tolerance never grows beyond this — so a real loss is
+/// never deferred indefinitely, no matter how jittery the link looks.
+const MAX_REORDER_TOLERANCE: u32 = 32;
+/// Consecutive in-order (non-belated) original arrivals after which the
+/// adaptive reorder tolerance decays by one (libsrt's consecutive-ordered-
+/// delivery counter), so a link that stops reordering recovers its fast NAKs.
+const REORDER_DECAY_AFTER: u32 = 50;
 
 impl Connection {
     /// Transitions into the connected (ARQ) phase: seeds the receive buffer with
@@ -92,10 +96,13 @@ impl Connection {
 
     /// The keepalive timer fired: if the connection has been silent for a whole
     /// period, send a KEEPALIVE (spec §3.2.6); always re-arm while connected.
+    /// Also the re-send cadence for an unconfirmed rekey KMREQ (spec §6.1.6) —
+    /// control packets are not ARQ-protected, so that exchange retries here.
     pub(super) fn on_keepalive_timer(&mut self, now: Instant) {
         if !matches!(self.state, State::Connected) {
             return; // not established (or tearing down): stop keepalives
         }
+        self.resend_pending_km(now);
         if now.saturating_duration_since(self.last_sent) >= KEEPALIVE_PERIOD {
             let bytes = encode_control(
                 self.peer_socket_id,
@@ -294,6 +301,15 @@ impl Connection {
     /// measure RTT.
     pub(super) fn on_ack(&mut self, ack: Ack, now: Instant) {
         self.send_buffer.ack(ack.last_ack_seq);
+        // A full ACK reports how much receive buffer the peer has free (spec
+        // §3.2.4); that bounds our send window (spec §4.8) — see
+        // `send_window_available`.
+        if let AckCif::Full {
+            avail_buffer_size, ..
+        } = ack.cif
+        {
+            self.peer_avail_window = avail_buffer_size;
+        }
         // Shed any now-too-late unacknowledged packets (send-side TLPKTDROP), so
         // the steady ACK cadence bounds how long a dead packet lingers.
         self.drop_too_late(now);
@@ -351,6 +367,9 @@ impl Connection {
             last_dropped = Some(front.seq);
             last_msg = front.message_number.value();
             self.send_buffer.drop_front();
+            // Count what is shed (libsrt `sndDropTotal`): silent discard would
+            // hide undeliverable data from the application entirely.
+            self.stats.packets_dropped_sent += 1;
         }
         if let (Some(first), Some(last)) = (first, last_dropped) {
             let bytes = encode_control(
@@ -407,14 +426,25 @@ impl Connection {
     /// Retransmits the packets we hold whose sequence falls in `[start, end]`.
     /// Iterates over the buffered packets (bounded by the buffer size) rather than
     /// the range, so a peer's oversized NAK range cannot make us loop unboundedly.
+    ///
+    /// **Timing-gate:** a packet retransmitted less than one smoothed RTT ago is
+    /// skipped — its previous resend is still in flight, so resending again only
+    /// produces a duplicate (libsrt's `checkRexmitRightTime`, the live-mode
+    /// default; spec §4.8.2: the loss list exists so packets "are not
+    /// retransmitted unnecessarily"). The *first* retransmit is never gated.
     fn retransmit_range(&mut self, start: SeqNumber, end: SeqNumber, now: Instant) {
         let (Some(first), Some(last)) = (self.send_buffer.first_seq(), self.send_buffer.last_seq())
         else {
             return;
         };
+        let gate = self.rtt.rtt();
         let mut seq = first;
         loop {
             if in_range(seq, start, end)
+                && self
+                    .send_buffer
+                    .last_retransmitted(seq)
+                    .is_none_or(|at| now.saturating_duration_since(at) >= gate)
                 && let Some(packet) = self.send_buffer.get(seq).cloned()
             {
                 self.stats.packets_retransmitted += 1;
@@ -429,6 +459,11 @@ impl Connection {
                         let mut p = packet;
                         p.retransmitted = true;
                         p.timestamp = ts;
+                        // Re-stamp the key slot: `encrypt` always uses the
+                        // *active* key, which may have rotated since the original
+                        // send. The even/odd flag selects the receiver's key
+                        // (spec §6.1.6), so flag, AAD, and keystream must agree.
+                        p.encryption = crypto.active_encryption();
                         let aad = p.header_aad();
                         p.payload = crypto.encrypt(seq.value(), &aad, &p.payload).0;
                         encode_data(&p)
@@ -436,6 +471,7 @@ impl Connection {
                     None => encode_retransmit(&packet, ts),
                 };
                 self.emit(datagram, now);
+                self.send_buffer.mark_retransmitted(seq, now);
             }
             if seq == last {
                 break;
@@ -534,6 +570,7 @@ impl Connection {
         }
         let timestamp = data.timestamp;
         let retransmitted = data.retransmitted;
+        let seq = data.seq;
         let payload_len = data.payload.len() as u64;
         if !self.recv_buffer.insert(data) {
             self.stats.packets_duplicate += 1;
@@ -541,6 +578,7 @@ impl Connection {
         }
         self.stats.packets_received += 1;
         self.stats.bytes_received += payload_len;
+        self.track_reorder(seq, retransmitted);
         // Feed the windowed delivery-rate estimator with this packet's arrival time
         // (microseconds since the connection began) and its size.
         let arrival_us = u64::try_from(now.saturating_duration_since(self.start).as_micros())
@@ -548,9 +586,14 @@ impl Connection {
         self.rate
             .record(arrival_us, u32::try_from(payload_len).unwrap_or(u32::MAX));
         // Anchor the TSBPD timeline on the first accepted packet (spec §4.5.1.1):
-        // it will play `latency` after arrival, and the rest relative to it.
+        // it will play `latency` after arrival, and the rest relative to it. The
+        // wrap tracker then follows the timestamp stream across its ~71.6-minute
+        // numeric wraps so later play times stay correct (spec §4.5.1.1 case 1).
         if self.tsbpd_base.is_none() {
             self.tsbpd_base = Some((timestamp, now));
+            self.ts_wrap = Some(TsbpdWrap::new(timestamp));
+        } else if let Some(wrap) = &mut self.ts_wrap {
+            wrap.observe(timestamp);
         }
         // Sample clock drift from fresh (non-retransmitted) arrivals: a
         // retransmission arrives late by design and would poison the estimate
@@ -570,13 +613,44 @@ impl Connection {
         if self.recv_buffer.has_gaps() {
             // Hold back gaps that may just be reordered in flight (reorder
             // tolerance); only NAK the aged ones.
-            let missing = self.recv_buffer.missing_aged(REORDER_TOLERANCE);
+            let missing = self.recv_buffer.missing_aged(self.reorder_tolerance);
             if !missing.is_empty() && missing != self.reported_loss {
                 self.send_nak(&missing, now);
                 self.reported_loss = missing;
             }
         } else if !self.reported_loss.is_empty() {
             self.reported_loss.clear();
+        }
+    }
+
+    /// Adapts the reorder tolerance to the link (5c in docs/known-issues/05;
+    /// libsrt's `SRTO_LOSSMAXTTL` adaptation). A **belated original** — a
+    /// non-retransmitted packet arriving circularly behind the highest original
+    /// seen — proves the link reordered it rather than dropped it; the
+    /// tolerance grows to that observed displacement (capped) so equally-deep
+    /// reordering is no longer NAK'd as loss. Sustained in-order arrival decays
+    /// the tolerance back, recovering fast loss reports. Retransmissions are
+    /// excluded: they arrive behind by design and would inflate the estimate.
+    fn track_reorder(&mut self, seq: SeqNumber, retransmitted: bool) {
+        if retransmitted {
+            return;
+        }
+        let Some(highest) = self.highest_recv_seq else {
+            self.highest_recv_seq = Some(seq);
+            return;
+        };
+        let offset = seq.offset_from(highest);
+        if offset >= 0 {
+            self.highest_recv_seq = Some(seq);
+            self.orderly_streak += 1;
+            if self.orderly_streak >= REORDER_DECAY_AFTER {
+                self.orderly_streak = 0;
+                self.reorder_tolerance = self.reorder_tolerance.saturating_sub(1);
+            }
+        } else {
+            let displacement = offset.unsigned_abs().min(MAX_REORDER_TOLERANCE);
+            self.reorder_tolerance = self.reorder_tolerance.max(displacement);
+            self.orderly_streak = 0;
         }
     }
 
@@ -620,9 +694,15 @@ impl Connection {
     /// The local time a packet with sender `timestamp` is *expected to arrive*
     /// (spec §4.5.1, drift-corrected per §4.7): `TsbpdTimeBase + PKT_TIMESTAMP +
     /// Drift`. The play time adds the latency on top.
+    ///
+    /// The offset comes from the wrap tracker, not a raw `wrapping_diff` against
+    /// the frozen anchor — a single circular diff inverts sign past ±2^31 µs
+    /// (~35.8 min), which would put every later play time in the past.
     fn tsbpd_expected_arrival(&self, timestamp: Timestamp) -> Option<Instant> {
         let (ref_ts, ref_instant) = self.tsbpd_base?;
-        let offset = i64::from(timestamp.wrapping_diff(ref_ts)) + self.drift.correction_us();
+        let wrap = self.ts_wrap.as_ref()?;
+        let offset =
+            wrap.offset_of(timestamp) - i64::from(ref_ts.as_micros()) + self.drift.correction_us();
         Some(apply_signed(ref_instant, offset))
     }
 
@@ -655,9 +735,12 @@ impl Connection {
         // ACKs report the contiguously-*received* point, which runs ahead of the
         // delivery base while TSBPD holds data — so the sender can release its
         // retransmission buffer promptly rather than after the latency window.
+        // An availability change re-ACKs even with no new data: a sender blocked
+        // on our advertised window has no other way to learn it reopened.
         let ack_point = self.recv_buffer.received_ack_point();
-        if self.last_acked_point == Some(ack_point) {
-            return; // nothing new to acknowledge
+        let avail = self.available_recv_buffer();
+        if self.last_acked_point == Some(ack_point) && self.last_acked_avail == Some(avail) {
+            return; // nothing new to acknowledge or advertise
         }
         let ack_number = self.next_ack_number;
         self.next_ack_number = self.next_ack_number.wrapping_add(1);
@@ -666,6 +749,7 @@ impl Connection {
             self.pending_acks.pop_front();
         }
         self.last_acked_point = Some(ack_point);
+        self.last_acked_avail = Some(avail);
         self.packets_since_ack = 0;
         let (packets_recv_rate, receiving_rate) = self.rate.delivery_rate();
         let ack = Ack {
@@ -676,7 +760,7 @@ impl Connection {
             cif: AckCif::Full {
                 rtt: micros_u32(self.rtt.rtt()),
                 rtt_variance: micros_u32(self.rtt.var()),
-                avail_buffer_size: self.config.flow_window,
+                avail_buffer_size: avail,
                 packets_recv_rate,
                 estimated_link_capacity: self.rate.peak_rate(),
                 receiving_rate,
@@ -691,6 +775,11 @@ impl Connection {
     }
 
     /// The periodic NAK timer fired (spec §4.8.2): re-report any outstanding loss.
+    ///
+    /// The periodic NAK is the backstop for a *lost* loss report — not a license
+    /// to re-send one every interval. A loss NAK'd less than one RTO ago is
+    /// (presumably) already being recovered, its retransmission still in flight;
+    /// only after an RTO of NAK silence is it re-reported.
     pub(super) fn on_nak_timer(&mut self, now: Instant) {
         if !matches!(self.state, State::Connected) {
             return;
@@ -699,10 +788,28 @@ impl Connection {
             id: TimerId::Nak,
             after: self.nak_interval(),
         });
-        let missing = self.recv_buffer.missing_aged(REORDER_TOLERANCE);
+        if self
+            .last_nak
+            .is_some_and(|at| now.saturating_duration_since(at) < self.rtt.rto())
+        {
+            return;
+        }
+        let missing = self.recv_buffer.missing_aged(self.reorder_tolerance);
         if !missing.is_empty() {
             self.send_nak(&missing, now);
         }
+    }
+
+    /// How much receive buffer we have free, in packets — what a full ACK
+    /// advertises (spec §3.2.4). Packets held for TSBPD play-out and delivered-
+    /// but-undrained events both still occupy memory, so both count against the
+    /// window; a stalled application therefore closes the peer's send window
+    /// instead of letting data pile up unbounded.
+    fn available_recv_buffer(&self) -> u32 {
+        let held = self.recv_buffer.occupancy() + self.events.len();
+        self.config
+            .flow_window
+            .saturating_sub(u32::try_from(held).unwrap_or(u32::MAX))
     }
 
     /// Emits a light ACK: the acknowledged sequence only, no RTT, no ACKACK.
@@ -721,7 +828,9 @@ impl Connection {
         self.emit(bytes, now);
     }
 
-    /// Emits a NAK carrying `missing` as a compressed loss list.
+    /// Emits a NAK carrying `missing` as a compressed loss list, stamping the
+    /// send time so the periodic NAK timer can back off (see
+    /// [`on_nak_timer`](Connection::on_nak_timer)).
     fn send_nak(&mut self, missing: &[(SeqNumber, SeqNumber)], now: Instant) {
         let loss = missing
             .iter()
@@ -733,6 +842,7 @@ impl Connection {
             ControlBody::Nak { loss },
         );
         self.emit(bytes, now);
+        self.last_nak = Some(now);
     }
 
     // ---- timers / derived intervals ----

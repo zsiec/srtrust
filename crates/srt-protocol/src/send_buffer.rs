@@ -13,6 +13,7 @@
 
 use core::cmp::Ordering;
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use crate::packet::DataPacket;
 use crate::seq::SeqNumber;
@@ -21,7 +22,17 @@ use crate::seq::SeqNumber;
 #[derive(Debug, Default)]
 pub(crate) struct SendBuffer {
     /// Unacknowledged packets, oldest at the front, contiguous by sequence.
-    packets: VecDeque<DataPacket>,
+    packets: VecDeque<Sent>,
+}
+
+/// One sent-but-unacknowledged packet plus its retransmission bookkeeping.
+#[derive(Debug)]
+struct Sent {
+    packet: DataPacket,
+    /// When this packet was last *retransmitted*; `None` until its first resend.
+    /// Read by the sender's retransmit timing-gate (spec §4.8.2: packets "are
+    /// not retransmitted unnecessarily").
+    last_retransmit: Option<Instant>,
 }
 
 impl SendBuffer {
@@ -35,32 +46,32 @@ impl SendBuffer {
         self.packets.is_empty()
     }
 
-    /// The number of unacknowledged packets held. Exercised by the unit tests.
-    #[allow(dead_code)]
+    /// The number of unacknowledged packets held — the in-flight count the
+    /// flow-window backpressure signal sums with the pacer queue.
     pub(crate) fn len(&self) -> usize {
         self.packets.len()
     }
 
     /// The oldest unacknowledged sequence number, if any.
     pub(crate) fn first_seq(&self) -> Option<SeqNumber> {
-        self.packets.front().map(|p| p.seq)
+        self.packets.front().map(|s| s.packet.seq)
     }
 
     /// The oldest unacknowledged packet, if any — used to test its age for
     /// send-side too-late dropping (TLPKTDROP / DROPREQ).
     pub(crate) fn front(&self) -> Option<&DataPacket> {
-        self.packets.front()
+        self.packets.front().map(|s| &s.packet)
     }
 
     /// Removes and returns the oldest unacknowledged packet (a send-side drop of a
     /// too-late packet). The buffer stays contiguous since this drops the front.
     pub(crate) fn drop_front(&mut self) -> Option<DataPacket> {
-        self.packets.pop_front()
+        self.packets.pop_front().map(|s| s.packet)
     }
 
     /// The newest stored sequence number, if any.
     pub(crate) fn last_seq(&self) -> Option<SeqNumber> {
-        self.packets.back().map(|p| p.seq)
+        self.packets.back().map(|s| s.packet.seq)
     }
 
     /// Stores a freshly-sent packet. Its sequence number must be the one
@@ -69,10 +80,13 @@ impl SendBuffer {
         debug_assert!(
             self.packets
                 .back()
-                .is_none_or(|last| packet.seq == last.seq.next()),
+                .is_none_or(|last| packet.seq == last.packet.seq.next()),
             "send buffer packets must be contiguous by sequence number"
         );
-        self.packets.push_back(packet);
+        self.packets.push_back(Sent {
+            packet,
+            last_retransmit: None,
+        });
     }
 
     /// Acknowledges everything before `next_expected` (an ACK's "last
@@ -81,7 +95,7 @@ impl SendBuffer {
     pub(crate) fn ack(&mut self, next_expected: SeqNumber) -> usize {
         let mut dropped = 0;
         while let Some(front) = self.packets.front() {
-            if front.seq.circular_cmp(next_expected) == Ordering::Less {
+            if front.packet.seq.circular_cmp(next_expected) == Ordering::Less {
                 self.packets.pop_front();
                 dropped += 1;
             } else {
@@ -91,16 +105,39 @@ impl SendBuffer {
         dropped
     }
 
+    /// The circular offset of `seq` past the front, if `seq` is stored.
+    ///
+    /// Storage is contiguous, so a stored packet sits exactly at this index. A
+    /// negative or past-the-back offset (already acknowledged, or not yet sent)
+    /// returns `None`.
+    fn index_of(&self, seq: SeqNumber) -> Option<usize> {
+        let front = self.packets.front()?.packet.seq;
+        usize::try_from(seq.offset_from(front))
+            .ok()
+            .filter(|&i| i < self.packets.len())
+    }
+
     /// Looks up a stored packet by sequence number for retransmission, or `None`
     /// if it has been acknowledged or was never sent.
-    ///
-    /// Storage is contiguous, so the packet — if present — sits at the circular
-    /// offset of `seq` past the front. A negative or out-of-range offset (already
-    /// acknowledged, or not yet sent) misses, which `try_from`/`get` report.
     pub(crate) fn get(&self, seq: SeqNumber) -> Option<&DataPacket> {
-        let front = self.packets.front()?.seq;
-        let offset = usize::try_from(seq.offset_from(front)).ok()?;
-        self.packets.get(offset)
+        Some(&self.packets.get(self.index_of(seq)?)?.packet)
+    }
+
+    /// When `seq` was last retransmitted, or `None` if it never has been (or is
+    /// not stored). The input to the sender's retransmit timing-gate: a packet
+    /// resent less than ~1 RTT ago is in flight and must not be resent yet.
+    pub(crate) fn last_retransmitted(&self, seq: SeqNumber) -> Option<Instant> {
+        self.packets.get(self.index_of(seq)?)?.last_retransmit
+    }
+
+    /// Records that `seq` was retransmitted at `now`. A no-op if `seq` is not
+    /// stored (already acknowledged).
+    pub(crate) fn mark_retransmitted(&mut self, seq: SeqNumber, now: Instant) {
+        if let Some(i) = self.index_of(seq)
+            && let Some(sent) = self.packets.get_mut(i)
+        {
+            sent.last_retransmit = Some(now);
+        }
     }
 }
 
@@ -195,6 +232,33 @@ mod tests {
         assert_eq!(dropped, 4);
         assert!(buf.is_empty());
         assert_eq!(buf.first_seq(), None);
+    }
+
+    #[test]
+    fn retransmit_stamp_round_trips_and_leaves_with_the_packet() {
+        let base = SeqNumber::new(1000);
+        let mut buf = filled(base, 3);
+        // The test only needs *an* instant to store and compare; the buffer never
+        // reads a clock itself.
+        let t = Instant::now();
+
+        assert_eq!(buf.last_retransmitted(base), None, "never resent yet");
+        buf.mark_retransmitted(base, t);
+        assert_eq!(buf.last_retransmitted(base), Some(t), "stamp recorded");
+        assert_eq!(
+            buf.last_retransmitted(base + 1),
+            None,
+            "stamp is per-packet"
+        );
+
+        // Marking a sequence we no longer hold must be a quiet no-op.
+        buf.mark_retransmitted(base.prev(), t);
+        assert_eq!(buf.last_retransmitted(base.prev()), None);
+
+        // Acknowledging the front drops its stamp with the packet.
+        buf.ack(base + 1);
+        assert_eq!(buf.last_retransmitted(base), None, "gone with the packet");
+        assert_eq!(buf.first_seq(), Some(base + 1));
     }
 
     #[test]

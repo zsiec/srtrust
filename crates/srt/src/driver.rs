@@ -107,6 +107,10 @@ pub(crate) async fn drive_connection<R: Runtime>(
     // Set once the app asks to close: we stop pulling commands (the connection is
     // lingering to drain its send buffer) and just let the core run to `Closed`.
     let mut closing = false;
+    // A received payload the app's data channel could not take yet (see
+    // `drain_events`): re-offered before new events, and flushed the moment the
+    // channel has room via the `reserve` arm of the `select!` below.
+    let mut pending_data: Option<Bytes> = None;
     // Reused scratch for the per-iteration batch of outgoing datagrams and the GSO
     // concatenation buffer, so the hot path does not allocate per loop.
     let mut sends: Vec<Bytes> = Vec::new();
@@ -138,7 +142,7 @@ pub(crate) async fn drive_connection<R: Runtime>(
         {
             break;
         }
-        if drain_events(&mut conn, &mut channels, now).await {
+        if drain_events(&mut conn, &mut channels, &mut pending_data, now) {
             break;
         }
 
@@ -180,6 +184,16 @@ pub(crate) async fn drive_connection<R: Runtime>(
             }
             // Just a wake-up; the due timer is handled at the top of the loop.
             () = timer => {}
+            // The app caught up: hand over the held-back payload the moment the
+            // data channel has room, then resume normal event draining.
+            permit = channels.data.reserve(), if pending_data.is_some() => {
+                match permit {
+                    Ok(permit) => {
+                        permit.send(pending_data.take().expect("guarded by is_some"));
+                    }
+                    Err(_) => break, // the application dropped its receiver
+                }
+            }
             // Backpressure: only pull application commands while the send window
             // has room. When it is full this arm is disabled, so queued `send`s
             // back up in the bounded command channel and `SrtStream::send` blocks
@@ -232,6 +246,7 @@ pub(crate) async fn drive_endpoint<R: Runtime>(
     socket: Arc<dyn AsyncUdpSocket>,
     mut listener: Listener,
     accept_tx: mpsc::Sender<Accepted>,
+    mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut recv_buf = vec![0u8; RECV_BUF];
     // Established connections, keyed by peer address; the value forwards inbound
@@ -239,8 +254,15 @@ pub(crate) async fn drive_endpoint<R: Runtime>(
     let mut connections: HashMap<SocketAddr, mpsc::Sender<(Instant, Bytes)>> = HashMap::new();
 
     loop {
-        let Ok((len, stride, from)) = poll_fn(|cx| socket.poll_recv_gro(cx, &mut recv_buf)).await
-        else {
+        // An idle endpoint parks on the socket indefinitely, so the listener
+        // handle's drop must be its own wake-up: the `SrtListener` holds the
+        // sender half of `shutdown`, and dropping it resolves this arm
+        // (BUG-05b, docs/known-issues/05 — task + socket leak on drop).
+        let received = tokio::select! {
+            received = poll_fn(|cx| socket.poll_recv_gro(cx, &mut recv_buf)) => received,
+            _ = &mut shutdown => return, // the application dropped the listener
+        };
+        let Ok((len, stride, from)) = received else {
             return;
         };
         // Stamp arrival once per socket read: every datagram in this batch is fed to
@@ -284,23 +306,36 @@ pub(crate) async fn drive_endpoint<R: Runtime>(
             let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
             let (data_tx, data_rx) = mpsc::channel(DATA_CAPACITY);
             let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CAPACITY);
-            if accept_tx.send((commands_tx, data_rx)).await.is_err() {
-                return; // the application dropped the listener handle
+            // Hand the new connection to the application *without waiting*: an
+            // `.await` here would park this demux loop — the only thing
+            // forwarding datagrams to every established connection on the
+            // socket — whenever the app fell behind on `accept()` (BUG-05g,
+            // docs/known-issues/05). A full backlog declines the connection
+            // instead: the caller times out and may retry, exactly like a full
+            // TCP SYN backlog.
+            match accept_tx.try_send((commands_tx, data_rx)) {
+                Ok(()) => {
+                    connections.insert(from, inbound_tx);
+                    let channels = StreamChannels {
+                        commands: commands_rx,
+                        data: data_tx,
+                        connected: None, // the acceptor is already connected
+                    };
+                    runtime.spawn(Box::pin(drive_connection(
+                        runtime.clone(),
+                        socket.clone(),
+                        conn,
+                        from,
+                        channels,
+                        Inbound::Demuxed(inbound_rx),
+                    )));
+                }
+                // Backlog full: drop `conn` undriven (never inserted, never
+                // spawned); the peer gets no ACKs and gives up on its own.
+                Err(TrySendError::Full(_)) => {}
+                // The application dropped the listener handle.
+                Err(TrySendError::Closed(_)) => return,
             }
-            connections.insert(from, inbound_tx);
-            let channels = StreamChannels {
-                commands: commands_rx,
-                data: data_tx,
-                connected: None, // the acceptor is already connected
-            };
-            runtime.spawn(Box::pin(drive_connection(
-                runtime.clone(),
-                socket.clone(),
-                conn,
-                from,
-                channels,
-                Inbound::Demuxed(inbound_rx),
-            )));
         }
     }
 }
@@ -366,9 +401,38 @@ async fn flush_sends(
     Ok(())
 }
 
-/// Drains the connection's application-facing events. Returns `true` when the
-/// driver should stop (the connection closed or failed, or the app hung up).
-async fn drain_events(conn: &mut Connection, channels: &mut StreamChannels, now: Instant) -> bool {
+/// Drains the connection's application-facing events **without ever blocking
+/// the driver loop** (BUG-05a, docs/known-issues/05): a `data.send(..).await`
+/// here would freeze ACKs, keepalives, and every timer the moment a slow
+/// application reader filled the channel — and the *peer* would then tear the
+/// connection down as idle.
+///
+/// A payload the channel cannot take right now is parked in `pending_data`
+/// (re-offered first on the next call; the driver also `select!`s on channel
+/// capacity), and event polling pauses. Undelivered events then back up inside
+/// the core, where they shrink the receive-buffer availability the next ACK
+/// advertises — closing the peer's send window instead of growing memory.
+///
+/// Returns `true` when the driver should stop (the connection closed or
+/// failed, or the app hung up).
+fn drain_events(
+    conn: &mut Connection,
+    channels: &mut StreamChannels,
+    pending_data: &mut Option<Bytes>,
+    now: Instant,
+) -> bool {
+    // Re-offer the held-back payload before touching new events, preserving
+    // delivery order.
+    if let Some(payload) = pending_data.take() {
+        match channels.data.try_send(payload) {
+            Ok(()) => {}
+            Err(TrySendError::Full(payload)) => {
+                *pending_data = Some(payload);
+                return false; // app still slow: leave events in the core
+            }
+            Err(TrySendError::Closed(_)) => return true,
+        }
+    }
     while let Some(event) = conn.poll_event() {
         match event {
             Event::Connected(_) => {
@@ -383,11 +447,14 @@ async fn drain_events(conn: &mut Connection, channels: &mut StreamChannels, now:
                 crate::fill_random(&mut sek);
                 conn.provide_rekey(&sek, now);
             }
-            Event::DataReceived(payload) => {
-                if channels.data.send(payload).await.is_err() {
-                    return true; // the application dropped its receiver
+            Event::DataReceived(payload) => match channels.data.try_send(payload) {
+                Ok(()) => {}
+                Err(TrySendError::Full(payload)) => {
+                    *pending_data = Some(payload);
+                    return false; // pause event polling until capacity frees
                 }
-            }
+                Err(TrySendError::Closed(_)) => return true,
+            },
             Event::Failed(reason) => {
                 if let Some(tx) = channels.connected.take() {
                     let _ = tx.send(Err(Error::Protocol(reason)));

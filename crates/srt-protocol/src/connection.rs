@@ -34,7 +34,7 @@ use crate::rtt::RttEstimator;
 use crate::send_buffer::SendBuffer;
 use crate::seq::SeqNumber;
 use crate::stats::Stats;
-use crate::timestamp::Timestamp;
+use crate::timestamp::{Timestamp, TsbpdWrap};
 
 mod arq;
 mod config;
@@ -215,9 +215,15 @@ pub struct Connection {
     /// A [`Event::KeyRefreshNeeded`] has been emitted and we are awaiting the
     /// embedder's fresh key bytes via [`provide_rekey`](Connection::provide_rekey).
     rekey_pending: bool,
-    /// The next key slot is installed and announced; the sender switches to it at
-    /// the refresh point.
+    /// The next key slot is installed, announced, **and confirmed by the peer's
+    /// KMRSP**; the sender switches to it at the refresh point.
     next_key_ready: bool,
+    /// A rekey Key Material announced but not yet KMRSP-confirmed: kept for
+    /// periodic re-sends (control packets are not ARQ-protected) and for
+    /// matching the peer's echoed confirmation.
+    pending_km: Option<Bytes>,
+    /// How many times `pending_km` has been re-announced.
+    km_retries: u32,
 
     // ---- ARQ state, live once `state` is `Connected` (see `connection::arq`) ----
     /// Sent-but-unacknowledged data packets, for retransmission.
@@ -228,6 +234,10 @@ pub struct Connection {
     /// first received data packet, mapping sender timestamps to local play times
     /// (spec §4.5.1). `None` until the first data packet arrives.
     tsbpd_base: Option<(Timestamp, Instant)>,
+    /// Tracks the 32-bit timestamp stream across its ~71.6-minute numeric wraps,
+    /// so play times stay correct past the ±2^31 µs circular-diff window (spec
+    /// §4.5.1.1 case 1). Anchored together with `tsbpd_base`.
+    ts_wrap: Option<TsbpdWrap>,
     /// Clock-drift correction applied to the TSBPD time base (spec §4.7).
     drift: DriftTracer,
     /// Smoothed RTT / variance from ACK/ACKACK round trips.
@@ -243,8 +253,29 @@ pub struct Connection {
     pending_acks: VecDeque<(u32, Instant)>,
     /// The last ACK point we sent in a full ACK, to avoid redundant ACKs.
     last_acked_point: Option<SeqNumber>,
+    /// The receive-buffer availability we last advertised in a full ACK; a
+    /// material change re-ACKs even with no new data, so a window-blocked
+    /// sender learns when our buffer frees up.
+    last_acked_avail: Option<u32>,
+    /// The peer's most recently advertised available receive buffer (spec
+    /// §3.2.4, from full ACKs) — the other half of the send window: we may not
+    /// outrun what the peer can hold (spec §4.8).
+    peer_avail_window: u32,
     /// The loss list most recently reported in a NAK, to suppress duplicates.
     reported_loss: Vec<(SeqNumber, SeqNumber)>,
+    /// Adaptive reorder tolerance, in packets: how many packets must arrive past
+    /// a gap before it is NAK'd as loss. Grows when a belated original proves
+    /// the link reorders (libsrt's `SRTO_LOSSMAXTTL` adaptation), decays with
+    /// sustained in-order arrival. See `connection::arq::track_reorder`.
+    reorder_tolerance: u32,
+    /// The circularly-highest original (non-retransmitted) data sequence seen —
+    /// the reference that exposes a belated arrival and its displacement.
+    highest_recv_seq: Option<SeqNumber>,
+    /// Consecutive non-belated original arrivals, for tolerance decay.
+    orderly_streak: u32,
+    /// When the last NAK (immediate or periodic) was sent; the periodic NAK
+    /// timer re-reports outstanding loss only after an RTO of NAK silence.
+    last_nak: Option<Instant>,
     /// Data packets received since the last (light or full) ACK.
     packets_since_ack: u32,
     /// EXP backoff multiplier; grows while no ACK arrives, resets on one.
@@ -343,6 +374,7 @@ impl Connection {
         state: State,
     ) -> Self {
         let config_max_bw = config.max_bw;
+        let config_flow_window = config.flow_window;
         // FEC clips the *wire* payload; size it to the largest unencrypted/CTR
         // payload (MTU less the 16 B SRT and 28 B UDP/IP headers). FEC is
         // unsupported with AES-GCM, so the GCM tag is irrelevant here.
@@ -364,9 +396,12 @@ impl Connection {
             packets_on_key: 0,
             rekey_pending: false,
             next_key_ready: false,
+            pending_km: None,
+            km_retries: 0,
             send_buffer: SendBuffer::new(),
             recv_buffer: RecvBuffer::new(initial_seq),
             tsbpd_base: None,
+            ts_wrap: None,
             drift: DriftTracer::new(),
             rtt: RttEstimator::new(),
             next_send_seq: initial_seq,
@@ -374,7 +409,13 @@ impl Connection {
             next_ack_number: 1,
             pending_acks: VecDeque::new(),
             last_acked_point: None,
+            last_acked_avail: None,
+            peer_avail_window: config_flow_window,
             reported_loss: Vec::new(),
+            reorder_tolerance: 0,
+            highest_recv_seq: None,
+            orderly_streak: 0,
+            last_nak: None,
             packets_since_ack: 0,
             exp_count: 1,
             live_cc: (config_max_bw > 0).then(|| LiveCc::new(config_max_bw)),
@@ -530,6 +571,8 @@ impl Connection {
                     // §6.1.6): a KMREQ announces the next key; a KMRSP confirms ours.
                     if subtype == EXT_KMREQ {
                         self.on_km_req(&cif, now);
+                    } else if subtype == EXT_KMRSP {
+                        self.on_km_rsp(&cif);
                     }
                 }
                 ControlBody::Handshake(hs) => {
@@ -658,20 +701,30 @@ impl Connection {
         fragments
     }
 
-    /// Whether the send queue has room for another packet — the backpressure
+    /// Whether the send window has room for another packet — the backpressure
     /// signal the I/O layer consults before accepting more application data.
     ///
-    /// This bounds the **pacing queue**: payloads submitted faster than the pace
-    /// (`max_bw`) can release them. That queue is the part that would otherwise
-    /// grow without bound (a slow pace versus a fast producer), so it is what
-    /// backpressure caps, to the negotiated flow window (spec §3.2.1). We do *not*
-    /// gate on the unacknowledged retransmission buffer: that is governed by ARQ,
-    /// and blocking the producer the instant it fills would starve the pacer of
-    /// the steady call cadence that keeps sending smooth (a stop-start producer
-    /// forces the pacer onto coarse OS timers, which burst and overrun the peer).
+    /// The window covers the **pacing queue** (payloads submitted faster than
+    /// `max_bw` releases them) *plus* the **sent-but-unacknowledged** packets in
+    /// the retransmission buffer, capped together at the flow window (spec §4.8:
+    /// the sender may not run ahead of acknowledgement without bound). Counting
+    /// only the pacer queue would leave the default unpaced config (`max_bw =
+    /// 0`, which bypasses that queue entirely) with no backpressure at all: a
+    /// stalled peer would let the app pour data into the unacked buffer, to be
+    /// silently shed by send-side TLPKTDROP (BUG-04, docs/known-issues/04).
+    ///
+    /// The cap is the smaller of our configured flow window and the peer's most
+    /// recently advertised available receive buffer — acknowledged data the peer
+    /// has not delivered to its application still occupies its buffer, so a
+    /// stalled receiver closes the window even while it keeps acknowledging.
+    ///
+    /// Throughput note: the window only closes when packets are genuinely
+    /// outstanding or the peer is genuinely full; the steady ACK cadence (10 ms
+    /// full ACKs, light ACKs every 64 packets) keeps it open on a healthy path.
     #[must_use]
     pub fn send_window_available(&self) -> bool {
-        self.send_queue.len() < self.config.flow_window as usize
+        let cap = self.config.flow_window.min(self.peer_avail_window) as usize;
+        self.send_queue.len() + self.send_buffer.len() < cap
     }
 
     /// Begins an orderly close (spec §3.2.7). If data is still in flight the
