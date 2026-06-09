@@ -1,0 +1,34 @@
+[package]
+name = "srt-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+description = "Sans-I/O implementation of the SRT (Secure Reliable Transport) protocol"
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = "1"
+thiserror = "2"
+
+# Encryption (spec §6). Pure-Rust RustCrypto only — no aws-lc-rs/openssl, so
+# `#![forbid(unsafe_code)]` holds. KEK = PBKDF2-HMAC-SHA1; SEK wrap = RFC-3394
+# AES key wrap; payload cipher = AES-CTR (default) or AES-GCM (authenticated).
+aes = "0.8"
+ctr = "0.9"
+aes-gcm = "0.10"
+aes-kw = "0.2"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hmac = "0.12"
+sha1 = "0.10"
+
+[dev-dependencies]
+proptest = "1"

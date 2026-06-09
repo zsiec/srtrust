@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3a6f37e08a35d42b6d58d8bbc35df4696cdbb805ddcc581fdece08d30678e278 # shrinks to bytes = []
+cc 270f6f9e3fd5bb9b75e91fcb54900eadee828d929919ff724044b22c8b27da0e # shrinks to km = KeyMaterial { key_flags: Even, key_length: 16, salt: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], wrapped: b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0" }

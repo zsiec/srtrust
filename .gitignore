@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target/
+
+# Backtrace / profiling output
+*.profraw
+
+# Local editor / OS cruft
+.DS_Store
+*.swp
+
+# Cargo leaves this for binaries; libraries commit Cargo.lock, which we do.
+# (Cargo.lock IS committed — this workspace ships runnable binaries/examples.)

@@ -1,0 +1,140 @@
+//! Connection-statistics tests: the cumulative counters track real traffic —
+//! sends, receives, and (on a lossy link) retransmissions. Driven through the
+//! deterministic [`sim::Pair`].
+
+mod sim;
+
+use std::time::Duration;
+
+use sim::{LinkConfig, Pair, t0};
+use srt_protocol::connection::{Config, Connection};
+use srt_protocol::listener::Listener;
+use srt_protocol::packet::SocketId;
+use srt_protocol::seq::SeqNumber;
+
+fn config() -> Config {
+    Config {
+        latency: Duration::from_secs(1),
+        mtu: 1500,
+        flow_window: 8192,
+        stream_id: None,
+        encryption: None,
+        max_bw: 0,
+        km_refresh_rate: 0,
+        fec: None,
+    }
+}
+
+fn connected(c2l: LinkConfig, l2c: LinkConfig, seed: u64) -> Pair {
+    let now = t0();
+    let caller = Connection::connect(
+        config(),
+        SocketId::new(0x11),
+        SeqNumber::new(1000),
+        now,
+        |_| {},
+    );
+    let listener = Listener::new(
+        config(),
+        SocketId::new(0x22),
+        SeqNumber::new(9000),
+        0xC0FF_EE12,
+        now,
+    );
+    let mut pair = Pair::new(now, caller, listener, c2l, l2c, seed);
+    assert!(pair.run_until_connected(200), "handshake completes");
+    pair
+}
+
+#[test]
+fn counters_track_a_clean_transfer() {
+    let mut pair = connected(LinkConfig::PERFECT, LinkConfig::PERFECT, 1);
+    let n = 12u8;
+    for i in 0..n {
+        pair.caller_send(&[i; 100]);
+    }
+    assert!(pair.run_until(|p| p.accepted_received().len() == usize::from(n), 50_000));
+
+    let caller = pair.caller_stats();
+    assert_eq!(caller.packets_sent, u64::from(n), "every send counted");
+    assert_eq!(caller.bytes_sent, u64::from(n) * 100);
+    assert_eq!(
+        caller.packets_retransmitted, 0,
+        "no retransmits on a perfect link"
+    );
+
+    let accepted = pair.accepted_stats().expect("accepted exists");
+    assert_eq!(
+        accepted.packets_received,
+        u64::from(n),
+        "every packet received"
+    );
+    assert_eq!(accepted.bytes_received, u64::from(n) * 100);
+    assert_eq!(
+        accepted.packets_dropped, 0,
+        "nothing dropped on a clean link"
+    );
+}
+
+#[test]
+fn the_receiver_estimates_its_delivery_rate() {
+    let mut pair = connected(LinkConfig::PERFECT, LinkConfig::PERFECT, 5);
+    // Send ~24 packets spaced 1 ms apart (in fake time), so the receiver sees a
+    // steady ~1000 packet/s arrival stream to estimate.
+    for i in 0..24u8 {
+        pair.caller_send(&[i; 800]);
+        pair.run_for(1_000); // advance 1 ms between sends
+    }
+    pair.run_for(50_000); // let the tail arrive
+
+    let accepted = pair.accepted_stats().expect("accepted exists");
+    // A steady arrival stream yields a real, non-zero rate estimate end-to-end
+    // (the exact value tracks the sim's event cadence). These are the numbers a
+    // full ACK now carries to the peer (spec §3.2.4).
+    assert!(
+        accepted.recv_rate_pps > 0 && accepted.recv_rate_pps < 1_000_000,
+        "a sane packet rate is reported, got {}",
+        accepted.recv_rate_pps
+    );
+    assert!(
+        accepted.recv_rate_bps > 0,
+        "byte rate also reported, got {}",
+        accepted.recv_rate_bps
+    );
+    assert!(
+        accepted.link_capacity_pps > 0,
+        "link-capacity estimate reported, got {}",
+        accepted.link_capacity_pps
+    );
+}
+
+#[test]
+fn retransmissions_are_counted_on_a_lossy_link() {
+    let lossy = LinkConfig {
+        loss: 0.3,
+        ..LinkConfig::PERFECT
+    };
+    let mut pair = connected(lossy, lossy, 0xBEEF);
+    let n = 20u8;
+    for i in 0..n {
+        pair.caller_send(&[i; 60]);
+    }
+    assert!(pair.run_until(|p| p.accepted_received().len() == usize::from(n), 200_000));
+
+    let caller = pair.caller_stats();
+    assert_eq!(caller.packets_sent, u64::from(n), "originals counted once");
+    assert!(
+        caller.packets_retransmitted > 0,
+        "loss forced retransmissions, got {}",
+        caller.packets_retransmitted
+    );
+
+    // The receiver still accepts exactly n unique packets; duplicates (from
+    // retransmits that crossed with recovery) are counted separately, not as data.
+    let accepted = pair.accepted_stats().unwrap();
+    assert_eq!(
+        accepted.packets_received,
+        u64::from(n),
+        "n unique delivered"
+    );
+}
