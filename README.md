@@ -6,7 +6,7 @@ with a thin async I/O layer on top.
 
 [![CI](https://github.com/zsiec/srtrust/actions/workflows/ci.yml/badge.svg)](https://github.com/zsiec/srtrust/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue.svg)](#minimum-supported-rust-version)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](#minimum-supported-rust-version)
 
 > **Status: early (`0.1.0`).** The protocol core is feature-complete for v1
 > (live mode, caller/listener) and has been interop-validated against the
@@ -139,7 +139,7 @@ negotiation, packet groups / bonding.
 
 ## Minimum Supported Rust Version
 
-**1.85** (edition 2024). MSRV bumps are not considered breaking changes.
+**1.88** (edition 2024). MSRV bumps are not considered breaking changes.
 
 ## Development
 

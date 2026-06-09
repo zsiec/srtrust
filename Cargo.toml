@@ -5,7 +5,7 @@ members = ["crates/srt-protocol", "crates/srt"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "MIT"
 authors = ["Thomas Symborski <thomas.symborski@gmail.com>"]
 repository = "https://github.com/zsiec/srtrust"

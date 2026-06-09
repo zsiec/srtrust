@@ -83,7 +83,7 @@ pub fn encode(ranges: &[LossRange], out: &mut BytesMut) {
 /// or [`LossListError::TruncatedRange`] if a range-start word has no following
 /// end word.
 pub fn decode(buf: &[u8]) -> Result<Vec<LossRange>, LossListError> {
-    if buf.len() % 4 != 0 {
+    if !buf.len().is_multiple_of(4) {
         return Err(LossListError::Misaligned(buf.len()));
     }
 
