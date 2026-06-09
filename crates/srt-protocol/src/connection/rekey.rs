@@ -54,13 +54,15 @@ impl Connection {
         }
         self.packets_on_key = self.packets_on_key.saturating_add(1);
         let announce_at = refresh.saturating_sub(self.km_preannounce());
-        if !self.rekey_pending && !self.next_key_ready && self.packets_on_key >= announce_at {
-            if let Some(enc) = &self.config.encryption {
-                self.rekey_pending = true;
-                self.events.push_back(Event::KeyRefreshNeeded {
-                    key_size: enc.key_size.bytes(),
-                });
-            }
+        if !self.rekey_pending
+            && !self.next_key_ready
+            && self.packets_on_key >= announce_at
+            && let Some(enc) = &self.config.encryption
+        {
+            self.rekey_pending = true;
+            self.events.push_back(Event::KeyRefreshNeeded {
+                key_size: enc.key_size.bytes(),
+            });
         }
     }
 
