@@ -47,15 +47,19 @@ pub(crate) const INBOUND_CAPACITY: usize = 4096;
 pub(crate) enum Inbound {
     /// Caller side: this connection owns the socket; read datagrams directly.
     Owned,
-    /// Accepted side: the endpoint's demux loop feeds us our datagrams.
-    Demuxed(mpsc::Receiver<Bytes>),
+    /// Accepted side: the endpoint's demux loop feeds us our datagrams, each paired
+    /// with the [`Instant`] it was read off the socket — so the core sees true
+    /// arrival spacing (for delivery-rate estimation), not the later moment this
+    /// task happens to dequeue it.
+    Demuxed(mpsc::Receiver<(Instant, Bytes)>),
 }
 
 impl Inbound {
-    /// Awaits the next demuxed datagram. For an [`Inbound::Owned`] connection this
-    /// never resolves — that connection's datagrams arrive on the socket arm of
-    /// the driver's `select!`, and this arm is guarded off.
-    async fn recv(&mut self) -> Option<Bytes> {
+    /// Awaits the next demuxed datagram and its socket-arrival time. For an
+    /// [`Inbound::Owned`] connection this never resolves — that connection's
+    /// datagrams arrive on the socket arm of the driver's `select!`, and this arm
+    /// is guarded off.
+    async fn recv(&mut self) -> Option<(Instant, Bytes)> {
         match self {
             Inbound::Owned => pending().await,
             Inbound::Demuxed(rx) => rx.recv().await,
@@ -166,7 +170,11 @@ pub(crate) async fn drive_connection<R: Runtime>(
             }
             datagram = inbound.recv(), if !owned => {
                 match datagram {
-                    Some(bytes) => conn.feed_recv_buf(&bytes, runtime.now()),
+                    // Feed with the *arrival* time stamped by the demux loop, not
+                    // `runtime.now()` — using a later processing time would collapse
+                    // the inter-arrival gaps (and inflate the delivery-rate estimate)
+                    // whenever several queued datagrams are drained back-to-back.
+                    Some((arrival, bytes)) => conn.feed_recv_buf(&bytes, arrival),
                     None => break, // the endpoint demux dropped us
                 }
             }
@@ -227,20 +235,24 @@ pub(crate) async fn drive_endpoint<R: Runtime>(
 ) {
     let mut recv_buf = vec![0u8; RECV_BUF];
     // Established connections, keyed by peer address; the value forwards inbound
-    // datagrams to that connection's driver task.
-    let mut connections: HashMap<SocketAddr, mpsc::Sender<Bytes>> = HashMap::new();
+    // datagrams (paired with their arrival time) to that connection's driver task.
+    let mut connections: HashMap<SocketAddr, mpsc::Sender<(Instant, Bytes)>> = HashMap::new();
 
     loop {
         let Ok((len, stride, from)) = poll_fn(|cx| socket.poll_recv_gro(cx, &mut recv_buf)).await
         else {
             return;
         };
+        // Stamp arrival once per socket read: every datagram in this batch is fed to
+        // its connection with this instant, so the core measures real inter-arrival
+        // spacing rather than the time it is later dequeued from the demux channel.
+        let now = runtime.now();
 
         // Established peer: hand each datagram to its driver and move on. A single
         // GRO read from one peer may carry several coalesced datagrams.
         if let Some(tx) = connections.get(&from) {
             for segment in gro_split(&recv_buf, len, stride) {
-                match tx.try_send(Bytes::copy_from_slice(segment)) {
+                match tx.try_send((now, Bytes::copy_from_slice(segment))) {
                     // Delivered, or the driver is swamped (drop and let ARQ recover
                     // the packet) — either way the demux loop never blocks here.
                     Ok(()) | Err(TrySendError::Full(_)) => {}
@@ -257,7 +269,6 @@ pub(crate) async fn drive_endpoint<R: Runtime>(
         // Unknown peer: a handshake for the listener to answer. (Handshake
         // datagrams are never coalesced with established-flow data, but split
         // anyway for uniformity.)
-        let now = runtime.now();
         for segment in gro_split(&recv_buf, len, stride) {
             listener.feed_recv_buf(segment, from, now);
         }

@@ -541,15 +541,12 @@ impl Connection {
         }
         self.stats.packets_received += 1;
         self.stats.bytes_received += payload_len;
-        // Feed the delivery-rate estimator with the inter-arrival gap (skip the
-        // first packet, which has no predecessor).
-        if let Some(prev) = self.last_recv {
-            let interval =
-                u32::try_from(now.saturating_duration_since(prev).as_micros()).unwrap_or(u32::MAX);
-            self.rate
-                .record(interval, u32::try_from(payload_len).unwrap_or(u32::MAX));
-        }
-        self.last_recv = Some(now);
+        // Feed the windowed delivery-rate estimator with this packet's arrival time
+        // (microseconds since the connection began) and its size.
+        let arrival_us = u64::try_from(now.saturating_duration_since(self.start).as_micros())
+            .unwrap_or(u64::MAX);
+        self.rate
+            .record(arrival_us, u32::try_from(payload_len).unwrap_or(u32::MAX));
         // Anchor the TSBPD timeline on the first accepted packet (spec §4.5.1.1):
         // it will play `latency` after arrival, and the rest relative to it.
         if self.tsbpd_base.is_none() {

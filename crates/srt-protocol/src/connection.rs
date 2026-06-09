@@ -283,9 +283,6 @@ pub struct Connection {
     stats: Stats,
     /// Receiver delivery-rate estimator, feeding the full ACK's rate fields.
     rate: RateEstimator,
-    /// Arrival time of the previous received data packet (for inter-arrival
-    /// intervals); `None` until the first data packet.
-    last_recv: Option<Instant>,
 
     /// Application-facing events awaiting [`Connection::poll_event`].
     events: VecDeque<Event>,
@@ -391,7 +388,6 @@ impl Connection {
             fec_recv,
             stats: Stats::default(),
             rate: RateEstimator::new(),
-            last_recv: None,
             events: VecDeque::new(),
             outputs: VecDeque::new(),
         }

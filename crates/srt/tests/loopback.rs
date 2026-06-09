@@ -175,3 +175,59 @@ async fn stats_report_the_transfer() {
     assert_eq!(server_stats.packets_received, 10, "receiver counted 10");
     assert_eq!(server_stats.bytes_received, 10 * 300);
 }
+
+#[tokio::test]
+async fn receive_rate_tracks_the_stream_not_burst_speed() {
+    // Stream ~700 packets paced ~2 ms apart (~500 pkt/s, just over a one-second
+    // averaging window) and check the receiver's reported delivery rate tracks the
+    // actual stream rate. Guards both the windowed-throughput estimator and the
+    // demux arrival-time plumbing: before those, the estimate read tens of
+    // thousands of pps (the core's burst-processing speed) for a few-hundred-pps
+    // stream.
+    const COUNT: usize = 700;
+    let mut listener = SrtListener::bind("127.0.0.1:0".parse().unwrap(), config()).unwrap();
+    let addr = listener.local_addr();
+
+    let caller = tokio::spawn(async move {
+        let stream = connect("127.0.0.1:0".parse().unwrap(), addr, config())
+            .await
+            .expect("connect");
+        for _ in 0..COUNT {
+            stream
+                .send(Bytes::from(vec![3u8; 800]))
+                .await
+                .expect("send");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        // Hold the stream open well past the server's stats sample so the
+        // connection isn't torn down out from under it.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    });
+
+    let mut server = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("accept within 10s")
+        .expect("accept ok");
+    let mut received = 0;
+    while received < COUNT {
+        match tokio::time::timeout(Duration::from_secs(5), server.recv()).await {
+            Ok(Some(_)) => received += 1,
+            _ => break,
+        }
+    }
+    let stats = server.stats().await.expect("stats");
+    caller.await.unwrap();
+
+    // ~500 pkt/s: the windowed estimate lands in the right ballpark — emphatically
+    // not the five-figure burst rate the old inter-arrival-median produced.
+    let pps = stats.recv_rate_pps;
+    assert!(
+        (150..=1_500).contains(&pps),
+        "recv_rate_pps={pps} should track the ~500 pkt/s stream, not burst speed"
+    );
+    assert!(
+        stats.recv_rate_bps > 50_000,
+        "recv_rate_bps={} implausibly low for a ~500 pkt/s stream",
+        stats.recv_rate_bps
+    );
+}

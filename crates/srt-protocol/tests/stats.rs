@@ -79,21 +79,25 @@ fn counters_track_a_clean_transfer() {
 #[test]
 fn the_receiver_estimates_its_delivery_rate() {
     let mut pair = connected(LinkConfig::PERFECT, LinkConfig::PERFECT, 5);
-    // Send ~24 packets spaced 1 ms apart (in fake time), so the receiver sees a
-    // steady ~1000 packet/s arrival stream to estimate.
-    for i in 0..24u8 {
-        pair.caller_send(&[i; 800]);
-        pair.run_for(1_000); // advance 1 ms between sends
+    // Stream a steady sequence for several seconds of fake time — well past the
+    // estimator's one-second averaging window, so it finalizes a reading. (The sim
+    // advances to the next event per `run_for`, so the arrival cadence follows the
+    // link/timer events, not a literal 1 ms; the exact rate is the harness's, the
+    // point is that a *sane stream rate* is reported.)
+    for _ in 0..300u32 {
+        pair.caller_send(&[7u8; 800]);
+        pair.run_for(1_000);
     }
-    pair.run_for(50_000); // let the tail arrive
+    pair.run_for(200_000); // let the tail arrive
 
     let accepted = pair.accepted_stats().expect("accepted exists");
-    // A steady arrival stream yields a real, non-zero rate estimate end-to-end
-    // (the exact value tracks the sim's event cadence). These are the numbers a
-    // full ACK now carries to the peer (spec §3.2.4).
+    // The windowed throughput reports the actual stream rate (cross-checked against
+    // libsrt's `mbpsRecvRate`, which reports ~the stream rate — not the orders-of-
+    // magnitude-higher intra-burst rate an inter-arrival median produces). These are
+    // the numbers a full ACK now carries to the peer (spec §3.2.4).
     assert!(
-        accepted.recv_rate_pps > 0 && accepted.recv_rate_pps < 1_000_000,
-        "a sane packet rate is reported, got {}",
+        (10..=50_000).contains(&accepted.recv_rate_pps),
+        "a sane stream rate is reported, got {}",
         accepted.recv_rate_pps
     );
     assert!(

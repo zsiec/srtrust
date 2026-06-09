@@ -36,11 +36,17 @@ use std::time::Duration;
 use srt::{Config, SrtListener, SrtStream};
 use tokio::sync::broadcast;
 
-/// A live-mode configuration with a 120 ms latency budget — typical for SRT
-/// contribution. Both listeners use the same shape.
+/// A live-mode configuration. The TSBPD latency budget is the receiver's buffer
+/// (and the sender's too-late-drop horizon): a larger value absorbs more arrival
+/// jitter at the cost of delay. Tunable via `SRT_LATENCY_MS` (default 120 ms),
+/// which is handy when relaying a bursty source to a decode-paced player.
 fn live_config() -> Config {
+    let latency_ms = std::env::var("SRT_LATENCY_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120);
     Config {
-        latency: Duration::from_millis(120),
+        latency: Duration::from_millis(latency_ms),
         mtu: 1500,
         flow_window: 8192,
         stream_id: None,
@@ -101,9 +107,19 @@ async fn ingest_loop(
             packets += 1;
             bytes_in += payload.len() as u64;
             if packets.is_multiple_of(1000) {
+                let s = source.stats().await.unwrap_or_default();
                 println!(
-                    "restream: ingested {packets} packets ({} KiB)",
-                    bytes_in / 1024
+                    "INGEST  {packets} pkts {}KiB | recv={} dropped={} dup={} undecrypt={} \
+                     rtt={}us±{} recvbuf={} rate={}pps",
+                    bytes_in / 1024,
+                    s.packets_received,
+                    s.packets_dropped,
+                    s.packets_duplicate,
+                    s.packets_undecryptable,
+                    s.rtt_us,
+                    s.rtt_var_us,
+                    s.recv_buffer_packets,
+                    s.recv_rate_pps,
                 );
             }
             // `send` errors only if there are no subscribers; that's fine — we just
@@ -140,9 +156,27 @@ async fn pump_to_client(
     client: SrtStream,
     mut rx: broadcast::Receiver<bytes::Bytes>,
 ) -> srt::Result<()> {
+    let mut sent: u64 = 0;
     loop {
         match rx.recv().await {
-            Ok(payload) => client.send(payload).await?,
+            Ok(payload) => {
+                client.send(payload).await?;
+                sent += 1;
+                if sent.is_multiple_of(1000) {
+                    let s = client.stats().await.unwrap_or_default();
+                    println!(
+                        "EGRESS  {sent} sent | retrans={} dropped={} flight={} \
+                         rtt={}us±{} sndrate={}pps cap={}pps",
+                        s.packets_retransmitted,
+                        s.packets_dropped,
+                        s.flight_size,
+                        s.rtt_us,
+                        s.rtt_var_us,
+                        s.recv_rate_pps,
+                        s.link_capacity_pps,
+                    );
+                }
+            }
             // The player stalled and we lapped the ring buffer: skip ahead to live
             // (MPEG-TS re-syncs on the next PAT/PMT) rather than fall further behind.
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
