@@ -230,6 +230,11 @@ pub struct Connection {
     send_buffer: SendBuffer,
     /// Out-of-order received data awaiting in-order delivery.
     recv_buffer: RecvBuffer,
+    /// The **negotiated** TSBPD latency — the larger of the two advertised
+    /// values (spec §4.3.1.2), set when the handshake completes. This, not
+    /// `config.latency`, governs play times and the sender's too-late drop
+    /// budget: a peer that asked for more buffering binds us too.
+    latency: Duration,
     /// TSBPD time base: the (sender-timestamp, local-instant) anchor from the
     /// first received data packet, mapping sender timestamps to local play times
     /// (spec §4.5.1). `None` until the first data packet arrives.
@@ -375,6 +380,7 @@ impl Connection {
     ) -> Self {
         let config_max_bw = config.max_bw;
         let config_flow_window = config.flow_window;
+        let config_latency = config.latency;
         // FEC clips the *wire* payload; size it to the largest unencrypted/CTR
         // payload (MTU less the 16 B SRT and 28 B UDP/IP headers). FEC is
         // unsupported with AES-GCM, so the GCM tag is irrelevant here.
@@ -400,6 +406,7 @@ impl Connection {
             km_retries: 0,
             send_buffer: SendBuffer::new(),
             recv_buffer: RecvBuffer::new(initial_seq),
+            latency: config_latency, // refined to the negotiated value on connect
             tsbpd_base: None,
             ts_wrap: None,
             drift: DriftTracer::new(),
@@ -490,7 +497,8 @@ impl Connection {
             Side::Acceptor,
             State::Conclusion,
         );
-        conn.crypto = crypto.map(SessionCrypto::even);
+        // The handshake KM may announce either or both slots; seed them all.
+        conn.crypto = crypto.map(SessionCrypto::from_initial);
         conn.key_material = key_material;
         let bytes = encode_control(
             peer_socket_id,

@@ -169,15 +169,22 @@ pub struct DataPacket {
 }
 
 impl DataPacket {
-    /// The packet's 16-byte wire header (the four header words, big-endian) —
-    /// used as the AES-GCM Additional Authenticated Data (libsrt authenticates the
-    /// header). Identical to the first 16 bytes [`Packet::encode`] produces.
+    /// The packet's 16-byte wire header (the four header words, big-endian)
+    /// with the `R` flag masked to 0 — the AES-GCM Additional Authenticated
+    /// Data (libsrt authenticates the header, excluding the retransmit flag).
+    /// Identical to the first 16 bytes [`Packet::encode`] produces for an
+    /// original (non-retransmitted) packet.
     #[must_use]
     pub fn header_aad(&self) -> [u8; 16] {
+        // The `R` (retransmitted) flag is deliberately EXCLUDED: it is the one
+        // header bit that changes on a resend while the stored ciphertext does
+        // not, so both ends authenticate the header as if R were 0 (libsrt
+        // convention — srtcore/core.cpp: "Reset retransmission flag (must be
+        // excluded from GCM auth tag)"). Retransmissions also keep the original
+        // timestamp, so every other field is stable and authenticated as-is.
         let w1 = (u32::from(self.position.to_bits()) << 30)
             | (u32::from(self.in_order) << 29)
             | (u32::from(self.encryption.to_bits()) << 27)
-            | (u32::from(self.retransmitted) << 26)
             | self.message_number.value();
         let mut aad = [0u8; 16];
         aad[0..4].copy_from_slice(&self.seq.value().to_be_bytes());
@@ -320,6 +327,31 @@ mod tests {
                 cif: crate::control::AckCif::Light,
             }),
         })
+    }
+
+    /// The GCM AAD must be identical for a packet and its retransmission: the
+    /// `R` flag is the one header bit that changes on resend while the stored
+    /// ciphertext does not, so it is excluded from the AAD (libsrt convention —
+    /// core.cpp: "Reset retransmission flag (must be excluded from GCM auth
+    /// tag)"). Everything else of the wire header is authenticated as-is.
+    #[test]
+    fn header_aad_excludes_the_retransmit_flag() {
+        let Packet::Data(original) = sample_data() else {
+            unreachable!()
+        };
+        let mut resent = original.clone();
+        resent.retransmitted = true;
+        assert_eq!(
+            original.header_aad(),
+            resent.header_aad(),
+            "a retransmission authenticates with the original's AAD"
+        );
+
+        // And the AAD still matches the wire encoding for everything *except*
+        // the R bit: an original packet's AAD is exactly its wire header.
+        let mut buf = BytesMut::new();
+        Packet::Data(original.clone()).encode(&mut buf);
+        assert_eq!(original.header_aad(), buf[..16], "AAD == wire header (R=0)");
     }
 
     #[test]

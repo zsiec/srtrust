@@ -41,12 +41,40 @@ impl SessionCrypto {
         }
     }
 
-    /// Installs (or replaces) the keys for one slot — used when a rekey Key
-    /// Material arrives announcing the next key.
+    /// A connection starting from whatever slots the peer's handshake Key
+    /// Material delivered (the active slot prefers even, matching libsrt's
+    /// initial key).
+    pub(crate) fn from_initial(km: UnwrappedKm) -> Self {
+        let active = if km.even.is_some() {
+            Encryption::Even
+        } else {
+            Encryption::Odd
+        };
+        SessionCrypto {
+            even: km.even,
+            odd: km.odd,
+            active,
+        }
+    }
+
+    /// Installs every slot a Key Material message delivered. A libsrt rekey
+    /// announces **both** keys; a slot the message did not carry is untouched.
+    pub(crate) fn install_unwrapped(&mut self, km: UnwrappedKm) {
+        if let Some(keys) = km.even {
+            self.even = Some(keys);
+        }
+        if let Some(keys) = km.odd {
+            self.odd = Some(keys);
+        }
+    }
+
+    /// Installs (or replaces) the keys for one slot — used when *we* stage our
+    /// own next key for a rotation (srtrust announces one key per message; a
+    /// received KM, which may carry both, goes through
+    /// [`install_unwrapped`](SessionCrypto::install_unwrapped)).
     pub(crate) fn install(&mut self, flags: KeyFlags, keys: SessionKeys) {
         match flags {
             KeyFlags::Odd => self.odd = Some(keys),
-            // Even, or Both (srtrust only ever carries one key per message).
             KeyFlags::Even | KeyFlags::Both => self.even = Some(keys),
         }
     }
@@ -92,10 +120,8 @@ impl SessionCrypto {
         self.active
     }
 
-    /// Whether the active cipher is an authenticated AEAD (AES-GCM). GCM
-    /// authenticates the packet header, which changes on retransmit, so a GCM
-    /// sender must keep plaintext and re-encrypt per send rather than store
-    /// ciphertext.
+    /// Whether the active cipher is an authenticated AEAD (AES-GCM) — read by
+    /// the payload-size budget (GCM appends a 16-byte tag).
     pub(crate) fn is_aead(&self) -> bool {
         let keys = match self.active {
             Encryption::Odd => self.odd.as_ref(),
@@ -123,6 +149,14 @@ impl SessionCrypto {
         // `None` here means a key we lack OR a GCM auth failure — both drop.
         keys.decrypt(seq, aad, payload)
     }
+}
+
+/// The session keys recovered from one Key Material message — one or both
+/// slots, depending on the message's `KK` flags (spec §6.1).
+#[derive(Debug)]
+pub(crate) struct UnwrappedKm {
+    pub(crate) even: Option<SessionKeys>,
+    pub(crate) odd: Option<SessionKeys>,
 }
 
 /// The negotiated per-connection encryption keys (single-key / even, spec §6).
@@ -155,24 +189,51 @@ impl SessionKeys {
         (SessionKeys { salt, sek, mode }, km)
     }
 
-    /// Responder side: recover the keys from a received Key Material message and
-    /// the shared passphrase.
+    /// Responder side: recover the key (or **keys**) from a received Key
+    /// Material message and the shared passphrase.
+    ///
+    /// A KM may announce one slot or both (spec §6.1; the `KK` flags): libsrt
+    /// wraps *both* SEKs into every rekey KM, even key first
+    /// (`hcrypt_ctx_rx.c`: "First SEK in `KMmsg` is eSEK if both SEK present").
+    /// The wrapped blob is `key_length` bytes per announced key; treating a
+    /// two-key blob as one double-length key would corrupt both slots.
     ///
     /// # Errors
     ///
     /// Returns [`CryptoError::IntegrityCheckFailed`] if the passphrase is wrong
-    /// (the unwrap integrity check fails).
+    /// (the unwrap integrity check fails), or
+    /// [`CryptoError::InvalidKeyLength`] if the unwrapped material does not
+    /// match the announced slot count.
     pub(crate) fn from_key_material(
         km: &KeyMaterial,
         passphrase: &[u8],
-    ) -> Result<Self, CryptoError> {
+    ) -> Result<UnwrappedKm, CryptoError> {
         let kek = kek::derive_kek(passphrase, &km.salt, usize::from(km.key_length));
         let sek = wrap::unwrap_key(&kek, &km.wrapped)?;
-        Ok(SessionKeys {
+        let klen = usize::from(km.key_length);
+        if sek.len() != klen * km.key_flags.key_count() {
+            return Err(CryptoError::InvalidKeyLength(sek.len()));
+        }
+        let make = |bytes: &[u8]| SessionKeys {
             salt: km.salt,
-            sek,
+            sek: bytes.to_vec(),
             // Adopt the cipher the initiator chose (CryptoModeAuto).
             mode: km.cipher,
+        };
+        Ok(match km.key_flags {
+            KeyFlags::Even => UnwrappedKm {
+                even: Some(make(&sek)),
+                odd: None,
+            },
+            KeyFlags::Odd => UnwrappedKm {
+                even: None,
+                odd: Some(make(&sek)),
+            },
+            // Even key first in a two-key blob (libsrt `hcrypt_ctx_rx.c`).
+            KeyFlags::Both => UnwrappedKm {
+                even: Some(make(&sek[..klen])),
+                odd: Some(make(&sek[klen..])),
+            },
         })
     }
 
@@ -353,10 +414,77 @@ mod tests {
         let (new_keys, km) =
             SessionKeys::from_raw(b"passphrase", KeyFlags::Odd, CipherMode::Ctr, salt, &sek);
         assert_eq!(km.key_flags, KeyFlags::Odd);
-        // The peer recovers the same SEK from the announced material.
+        // The peer recovers the same SEK, in the announced (odd) slot only.
         let recovered = SessionKeys::from_key_material(&km, b"passphrase").unwrap();
+        assert!(recovered.even.is_none(), "only the odd slot was announced");
+        let odd = recovered.odd.expect("the announced odd key");
         let ct = new_keys.encrypt(3, AAD, b"payload");
-        assert_eq!(&recovered.decrypt(3, AAD, &ct).unwrap()[..], b"payload");
+        assert_eq!(&odd.decrypt(3, AAD, &ct).unwrap()[..], b"payload");
+    }
+
+    /// libsrt wraps **both** SEKs into every rekey Key Material message (even
+    /// key first in the blob — `hcrypt_ctx_rx.c`). Treating the two-key blob as
+    /// one double-length key corrupts both slots; found live against libsrt
+    /// 1.5.5 (every post-rotation packet undecryptable).
+    #[test]
+    fn a_both_key_material_recovers_both_slots() {
+        let salt = [0x33u8; SALT_LEN];
+        let even_sek = [0x11u8; 16];
+        let odd_sek = [0x22u8; 16];
+        let kek = kek::derive_kek(b"passphrase", &salt, 16);
+        let both = [even_sek, odd_sek].concat();
+        let wrapped = wrap::wrap_key(&kek, &both).expect("wrap two keys");
+        let km = KeyMaterial {
+            key_flags: KeyFlags::Both,
+            cipher: CipherMode::Ctr,
+            key_length: 16,
+            salt,
+            wrapped: Bytes::from(wrapped),
+        };
+
+        let recovered = SessionKeys::from_key_material(&km, b"passphrase").unwrap();
+        let even = recovered.even.expect("even slot present");
+        let odd = recovered.odd.expect("odd slot present");
+
+        // Each slot must hold exactly the key wrapped for it (even first).
+        let reference_even = SessionKeys::from_raw(
+            b"passphrase",
+            KeyFlags::Even,
+            CipherMode::Ctr,
+            salt,
+            &even_sek,
+        )
+        .0;
+        let ct = reference_even.encrypt(7, AAD, b"even payload");
+        assert_eq!(&even.decrypt(7, AAD, &ct).unwrap()[..], b"even payload");
+        let reference_odd = SessionKeys::from_raw(
+            b"passphrase",
+            KeyFlags::Odd,
+            CipherMode::Ctr,
+            salt,
+            &odd_sek,
+        )
+        .0;
+        let ct = reference_odd.encrypt(9, AAD, b"odd payload");
+        assert_eq!(&odd.decrypt(9, AAD, &ct).unwrap()[..], b"odd payload");
+    }
+
+    /// A wrapped blob whose length disagrees with the announced slot count is
+    /// rejected, never misinterpreted.
+    #[test]
+    fn a_key_material_with_mismatched_length_is_rejected() {
+        let salt = [0x44u8; SALT_LEN];
+        let kek = kek::derive_kek(b"passphrase", &salt, 16);
+        // Two keys' worth of material, but flagged as a single even key.
+        let wrapped = wrap::wrap_key(&kek, &[0x55u8; 32]).expect("wrap");
+        let km = KeyMaterial {
+            key_flags: KeyFlags::Even,
+            cipher: CipherMode::Ctr,
+            key_length: 16,
+            salt,
+            wrapped: Bytes::from(wrapped),
+        };
+        assert!(SessionKeys::from_key_material(&km, b"passphrase").is_err());
     }
 
     #[test]

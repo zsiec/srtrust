@@ -167,10 +167,11 @@ impl Connection {
             let Some(crypto) = self.crypto.as_mut() else {
                 return;
             };
-            let Ok(keys) = SessionKeys::from_key_material(&km, &passphrase) else {
+            let Ok(unwrapped) = SessionKeys::from_key_material(&km, &passphrase) else {
                 return; // wrong passphrase / undecryptable: ignore
             };
-            crypto.install(km.key_flags, keys);
+            // A libsrt rekey announces *both* keys; install every delivered slot.
+            crypto.install_unwrapped(unwrapped);
             true
         };
         if installed {

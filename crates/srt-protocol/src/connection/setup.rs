@@ -17,8 +17,8 @@ use super::{
     SYN_INTERVAL, State, TimerId, encode_control,
 };
 use crate::control::ControlBody;
-use crate::crypto::SessionKeys;
 use crate::crypto::key_material::KeyMaterial;
+use crate::crypto::{SessionKeys, UnwrappedKm};
 use crate::error::{ConnectionError, CryptoError};
 use crate::handshake::{
     EncryptionField, Handshake, HandshakeExtension, HandshakeType, SrtFlags, SrtHandshake,
@@ -159,12 +159,12 @@ pub(super) fn negotiate(local_latency: Duration, peer_hs: &Handshake) -> Negotia
 }
 
 /// Sets up the acceptor's session keys from the caller's conclusion (spec §6),
-/// returning the keys and the Key Material bytes to echo as KMRSP. An
-/// unencrypted connection yields `(None, None)`.
+/// returning the recovered key slot(s) and the Key Material bytes to echo as
+/// KMRSP. An unencrypted connection yields `(None, None)`.
 pub(super) fn accept_crypto(
     encryption: Option<&EncryptionSettings>,
     caller_hs: &Handshake,
-) -> Result<(Option<SessionKeys>, Option<Bytes>), ConnectionError> {
+) -> Result<(Option<UnwrappedKm>, Option<Bytes>), ConnectionError> {
     let Some(enc) = encryption else {
         return Ok((None, None));
     };
@@ -186,11 +186,20 @@ pub(super) fn accept_crypto(
 }
 
 /// Builds the live-mode HSREQ/HSRSP extension we always advertise.
+///
+/// `PERIODIC_NAK` matters for interop: without it, libsrt assumes the peer
+/// sends no loss reports and falls back to blind timeout-based retransmission
+/// (LATEREXMIT), producing un-NAK'd duplicate traffic toward a receiver that
+/// does NAK. srtrust implements periodic NAK reports, so it says so.
 pub(super) fn srt_handshake_ext(latency_ms: u16) -> SrtHandshake {
     SrtHandshake {
         srt_version: SRT_LIBRARY_VERSION,
         flags: SrtFlags::from_bits(
-            SrtFlags::TSBPD_SND | SrtFlags::TSBPD_RCV | SrtFlags::TLPKTDROP | SrtFlags::REXMIT,
+            SrtFlags::TSBPD_SND
+                | SrtFlags::TSBPD_RCV
+                | SrtFlags::TLPKTDROP
+                | SrtFlags::PERIODIC_NAK
+                | SrtFlags::REXMIT,
         ),
         recv_tsbpd_delay: latency_ms,
         send_tsbpd_delay: latency_ms,
@@ -200,4 +209,32 @@ pub(super) fn srt_handshake_ext(latency_ms: u16) -> SrtHandshake {
 /// A [`Duration`] as whole milliseconds clamped to `u16` (the wire field width).
 pub(super) fn millis_u16(d: Duration) -> u16 {
     u16::try_from(d.as_millis()).unwrap_or(u16::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handshake::SrtFlags;
+
+    /// The HSREQ/HSRSP extension must advertise every capability srtrust
+    /// actually implements. `PERIODIC_NAK` (libsrt `SRT_OPT_NAKREPORT`) in
+    /// particular: without it, libsrt assumes the peer never sends loss
+    /// reports and falls back to blind timeout-based retransmission
+    /// (LATEREXMIT) — wasteful duplicates for a receiver that *does* NAK.
+    /// Found live against libsrt 1.5.5 (un-NAK'd retransmissions on the wire).
+    #[test]
+    fn the_handshake_advertises_every_implemented_capability() {
+        let hs = srt_handshake_ext(120);
+        for (flag, name) in [
+            (SrtFlags::TSBPD_SND, "TSBPD_SND"),
+            (SrtFlags::TSBPD_RCV, "TSBPD_RCV"),
+            (SrtFlags::TLPKTDROP, "TLPKTDROP"),
+            (SrtFlags::PERIODIC_NAK, "PERIODIC_NAK"),
+            (SrtFlags::REXMIT, "REXMIT"),
+        ] {
+            assert!(hs.flags.contains(flag), "{name} must be advertised");
+        }
+        assert_eq!(hs.recv_tsbpd_delay, 120);
+        assert_eq!(hs.send_tsbpd_delay, 120);
+    }
 }

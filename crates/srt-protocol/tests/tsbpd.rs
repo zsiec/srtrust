@@ -25,17 +25,26 @@ fn config(latency_ms: u64) -> Config {
 }
 
 fn connected(c2l: LinkConfig, l2c: LinkConfig, seed: u64, latency_ms: u64) -> Pair {
+    connected_asymmetric(c2l, l2c, seed, latency_ms, latency_ms)
+}
+
+fn connected_asymmetric(
+    c2l: LinkConfig,
+    l2c: LinkConfig,
+    seed: u64,
+    caller_latency_ms: u64,
+    listener_latency_ms: u64,
+) -> Pair {
     let now = t0();
-    let cfg = config(latency_ms);
     let caller = Connection::connect(
-        cfg.clone(),
+        config(caller_latency_ms),
         SocketId::new(0x11),
         SeqNumber::new(1000),
         now,
         |_| {},
     );
     let listener = Listener::new(
-        cfg,
+        config(listener_latency_ms),
         SocketId::new(0x22),
         SeqNumber::new(9000),
         0xC0FF_EE12,
@@ -129,6 +138,35 @@ fn delivery_is_still_held_after_the_timestamp_wrap_window() {
     assert!(
         (200_000..=230_000).contains(&elapsed),
         "played ~latency after send even across the wrap, got {elapsed} us"
+    );
+}
+
+/// Latency is **negotiated**: each side advertises its configured value and the
+/// connection uses the larger (spec §4.3.1.2; libsrt `SRTO_RCVLATENCY` /
+/// `SRTO_PEERLATENCY` semantics). A receiver configured low must still hold
+/// packets for the higher latency the *sender* advertised — and the sender's
+/// too-late drop budget must use the same negotiated value. Found live: srtrust
+/// computed and advertised the negotiated value, then used its local config
+/// everywhere.
+#[test]
+fn the_negotiated_latency_binds_a_low_latency_receiver() {
+    // Caller (the sender) wants 400 ms; the listener (the receiver) only 100 ms.
+    // Negotiated: 400 ms — the receiver must hold packets that long.
+    let mut pair = connected_asymmetric(LinkConfig::PERFECT, LinkConfig::PERFECT, 17, 400, 100);
+
+    let sent_at = pair.fake_micros();
+    pair.caller_send(&payload(0));
+
+    pair.run_for(250_000); // 250 ms: past the receiver's own 100 ms config
+    assert!(
+        pair.accepted_received().is_empty(),
+        "the packet must be held for the negotiated 400 ms, not the local 100 ms"
+    );
+    assert!(pair.run_until(|p| !p.accepted_received().is_empty(), 10_000));
+    let elapsed = pair.fake_micros() - sent_at;
+    assert!(
+        (400_000..=440_000).contains(&elapsed),
+        "delivered ~negotiated latency after send (10 ms link + 400 ms), got {elapsed} us"
     );
 }
 

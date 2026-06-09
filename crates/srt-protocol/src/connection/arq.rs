@@ -65,6 +65,9 @@ impl Connection {
     pub(super) fn enter_connected(&mut self, negotiated: Negotiated, now: Instant) {
         self.state = State::Connected;
         self.peer_socket_id = negotiated.peer_socket_id;
+        // The agreed latency (the larger of the two advertised values, spec
+        // §4.3.1.2) binds both TSBPD play times and the sender's drop budget.
+        self.latency = negotiated.latency;
         self.recv_buffer = RecvBuffer::new(negotiated.peer_initial_seq);
         self.outputs.push_back(Output::SetTimer {
             id: TimerId::Ack,
@@ -166,34 +169,29 @@ impl Connection {
             dest_socket_id: self.peer_socket_id,
             payload: fragment.payload,
         };
-        // Encrypt for the wire. Under AES-GCM the header is authenticated and
-        // changes on retransmit, so we keep the *plaintext* packet in the send
-        // buffer and re-encrypt each resend (see `retransmit_range`); under AES-CTR
-        // the ciphertext is stable, so we store it directly.
+        // Encrypt for the wire and store the *ciphertext* packet — for AES-GCM
+        // too: the AAD excludes the only header bit a resend changes (the `R`
+        // flag), and retransmissions keep the original timestamp, so the stored
+        // ciphertext and auth tag stay valid for every resend. This matches
+        // libsrt, which encrypts once at first send and resends the buffered
+        // ciphertext verbatim.
         let (stored, datagram) = if let Some(crypto) = &self.crypto {
             let aad = packet.header_aad();
-            let ciphertext = crypto.encrypt(seq.value(), &aad, &packet.payload).0;
-            if crypto.is_aead() {
-                let mut wire = packet.clone();
-                wire.payload = ciphertext;
-                (packet, encode_data(&wire)) // store plaintext, send ciphertext
-            } else {
-                packet.payload = ciphertext;
-                let datagram = encode_data(&packet);
-                (packet, datagram) // store ciphertext (CTR)
-            }
+            packet.payload = crypto.encrypt(seq.value(), &aad, &packet.payload).0;
+            let datagram = encode_data(&packet);
+            (packet, datagram)
         } else {
             let datagram = encode_data(&packet);
             (packet, datagram)
         };
         let was_empty = self.send_buffer.is_empty();
         let payload_size = stored.payload.len();
-        // FEC: clip this packet's *wire* fields into the current row group. The
-        // stored payload is the wire payload for plaintext/CTR (FEC is unsupported
-        // with AES-GCM, where it would differ). A completed group yields a parity
-        // packet that shares this sequence number (spec App.; libsrt packet filter);
-        // it is emitted *after* this data packet below, so the parity always
-        // follows the complete group on the wire.
+        // FEC: clip this packet's *wire* fields into the current row group (the
+        // stored payload is always the wire payload now; FEC stays unsupported
+        // with AES-GCM by policy). A completed group yields a parity packet that
+        // shares this sequence number (spec App.; libsrt packet filter); it is
+        // emitted *after* this data packet below, so the parity always follows
+        // the complete group on the wire.
         let parity = self.fec_send.as_mut().map(|fec| {
             fec.feed(FecData {
                 length: u16::try_from(payload_size).unwrap_or(u16::MAX),
@@ -354,7 +352,7 @@ impl Connection {
     /// will never come. A packet whose age exceeds the TSBPD latency cannot arrive
     /// before its play time, so retransmitting it is wasted bandwidth.
     pub(super) fn drop_too_late(&mut self, now: Instant) {
-        let budget = micros_i64(self.config.latency);
+        let budget = micros_i64(self.latency);
         let now_ts = self.wire_ts(now);
         let mut first = None;
         let mut last_dropped = None;
@@ -449,28 +447,13 @@ impl Connection {
             {
                 self.stats.packets_retransmitted += 1;
                 self.stats.bytes_retransmitted += packet.payload.len() as u64;
-                let ts = self.wire_ts(now);
-                // Under GCM the buffered packet is plaintext: re-stamp the header
-                // (R flag + timestamp) and re-encrypt so its authenticated AAD
-                // matches what the receiver will rebuild. CTR stores ciphertext, so
-                // a header re-stamp alone (its counter is sequence-based) suffices.
-                let datagram = match self.crypto.as_ref().filter(|c| c.is_aead()) {
-                    Some(crypto) => {
-                        let mut p = packet;
-                        p.retransmitted = true;
-                        p.timestamp = ts;
-                        // Re-stamp the key slot: `encrypt` always uses the
-                        // *active* key, which may have rotated since the original
-                        // send. The even/odd flag selects the receiver's key
-                        // (spec §6.1.6), so flag, AAD, and keystream must agree.
-                        p.encryption = crypto.active_encryption();
-                        let aad = p.header_aad();
-                        p.payload = crypto.encrypt(seq.value(), &aad, &p.payload).0;
-                        encode_data(&p)
-                    }
-                    None => encode_retransmit(&packet, ts),
-                };
-                self.emit(datagram, now);
+                // The stored (possibly encrypted) packet is resent verbatim with
+                // only the `R` flag set: the original timestamp keeps the
+                // receiver's TSBPD schedule (and, under GCM, the auth tag) intact,
+                // and the original key flag selects a key the receiver still
+                // holds — both slots survive a rotation (spec §6.1.6; matches
+                // libsrt's buffered-ciphertext resend).
+                self.emit(encode_retransmit(&packet), now);
                 self.send_buffer.mark_retransmitted(seq, now);
             }
             if seq == last {
@@ -709,7 +692,7 @@ impl Connection {
     /// The local play time of a packet with sender `timestamp` (spec §4.5.1):
     /// `TsbpdTimeBase + PKT_TIMESTAMP + TsbpdDelay + Drift`.
     fn tsbpd_play_time(&self, timestamp: Timestamp) -> Option<Instant> {
-        Some(self.tsbpd_expected_arrival(timestamp)? + self.config.latency)
+        Some(self.tsbpd_expected_arrival(timestamp)? + self.latency)
     }
 
     /// Handles an ACKACK (spec §4.10): the round trip from our ACK to this reply
@@ -889,12 +872,13 @@ fn encode_data(packet: &DataPacket) -> Bytes {
     buf.freeze()
 }
 
-/// Encodes a retransmission: the original packet with the `R` flag set and a
-/// fresh timestamp.
-fn encode_retransmit(packet: &DataPacket, timestamp: Timestamp) -> Bytes {
+/// Encodes a retransmission: the original packet, bit-for-bit, with only the
+/// `R` flag set. The original timestamp is kept — the receiver's TSBPD play
+/// time derives from it, and under AES-GCM it is authenticated by the stored
+/// tag (matching libsrt, which resends its buffered ciphertext verbatim).
+fn encode_retransmit(packet: &DataPacket) -> Bytes {
     let mut resent = packet.clone();
     resent.retransmitted = true;
-    resent.timestamp = timestamp;
     let mut buf = BytesMut::new();
     Packet::Data(resent).encode(&mut buf);
     buf.freeze()
