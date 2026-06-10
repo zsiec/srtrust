@@ -19,16 +19,10 @@ const PKT_SIZE: u64 = 1472;
 const MAX_BW: u64 = PKT_SIZE * 1_000_000 / PERIOD_US; // 147_200 bytes/s
 
 fn config(max_bw: u64) -> Config {
-    Config {
-        latency: Duration::from_millis(300),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    Config::default()
+        .with_latency(Duration::from_millis(300))
+        .with_flow_window(8192)
+        .with_max_bw(max_bw)
 }
 
 fn connected(max_bw: u64) -> Pair {

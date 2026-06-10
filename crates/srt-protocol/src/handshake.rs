@@ -80,6 +80,12 @@ impl HandshakeType {
     /// Rendezvous done (`0xFFFFFFFD`).
     pub const DONE: HandshakeType = HandshakeType(0xFFFF_FFFD);
 
+    /// The base of the rejection range (libsrt's `URQ_FAILURE_TYPES`): a
+    /// handshake type of `1000 + code` is a rejection carrying `code` (spec
+    /// §4.3, Table 7). The range stops short of the rendezvous values
+    /// (`0xFFFF_FFFD..`), which are not rejections.
+    const REJECTION_BASE: u32 = 1000;
+
     /// Wraps a raw handshake-type value.
     #[must_use]
     pub const fn from_raw(value: u32) -> Self {
@@ -90,6 +96,146 @@ impl HandshakeType {
     #[must_use]
     pub const fn to_raw(self) -> u32 {
         self.0
+    }
+
+    /// The handshake type that rejects with `reason` (a `URQ_FAILURE` value).
+    #[must_use]
+    pub const fn rejection(reason: RejectReason) -> Self {
+        HandshakeType(Self::REJECTION_BASE + reason.code())
+    }
+
+    /// Decodes this type as a rejection, or `None` for the ordinary handshake
+    /// types (induction, conclusion, the rendezvous values, …).
+    #[must_use]
+    pub const fn reject_reason(self) -> Option<RejectReason> {
+        if self.0 >= Self::REJECTION_BASE && self.0 < HandshakeType::DONE.0 {
+            Some(RejectReason::from_code(self.0 - Self::REJECTION_BASE))
+        } else {
+            None
+        }
+    }
+}
+
+/// Why a handshake was rejected (spec §4.3, Table 7; libsrt's `SRT_REJ_*`).
+/// Sent on the wire as handshake type `1000 + code`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RejectReason {
+    /// Unknown or unspecified reason (`SRT_REJ_UNKNOWN`, 0).
+    Unknown,
+    /// System resource failure on the peer (`SRT_REJ_SYSTEM`, 1).
+    System,
+    /// The peer rejected the connection (`SRT_REJ_PEER`, 2).
+    Peer,
+    /// Resource allocation failed (`SRT_REJ_RESOURCE`, 3).
+    Resource,
+    /// A rogue or malformed handshake (`SRT_REJ_ROGUE`, 4).
+    Rogue,
+    /// The listener's backlog is full (`SRT_REJ_BACKLOG`, 5).
+    Backlog,
+    /// An internal error on the peer (`SRT_REJ_IPE`, 6).
+    InternalError,
+    /// The socket is being closed (`SRT_REJ_CLOSE`, 7).
+    Close,
+    /// Peer protocol version too old (`SRT_REJ_VERSION`, 8).
+    Version,
+    /// Rendezvous cookie collision (`SRT_REJ_RDVCOOKIE`, 9).
+    RdvCookie,
+    /// Key Material the peer's passphrase cannot unwrap — a passphrase
+    /// mismatch (`SRT_REJ_BADSECRET`, 10).
+    BadSecret,
+    /// Exactly one side requires encryption (`SRT_REJ_UNSECURE`, 11).
+    Unsecure,
+    /// Message-mode / stream-mode mismatch (`SRT_REJ_MESSAGEAPI`, 12).
+    MessageApi,
+    /// Congestion-controller mismatch (`SRT_REJ_CONGESTION`, 13).
+    Congestion,
+    /// Packet-filter (FEC) mismatch (`SRT_REJ_FILTER`, 14).
+    Filter,
+    /// Group-membership mismatch (`SRT_REJ_GROUP`, 15).
+    Group,
+    /// The connect attempt timed out on the peer (`SRT_REJ_TIMEOUT`, 16).
+    Timeout,
+    /// Any other code, carried verbatim — libsrt reserves 1000+ for
+    /// HTTP-style predefined codes and 2000+ for application-defined ones.
+    Other(u32),
+}
+
+impl RejectReason {
+    /// The wire code (the handshake type minus 1000).
+    #[must_use]
+    pub const fn code(self) -> u32 {
+        match self {
+            RejectReason::Unknown => 0,
+            RejectReason::System => 1,
+            RejectReason::Peer => 2,
+            RejectReason::Resource => 3,
+            RejectReason::Rogue => 4,
+            RejectReason::Backlog => 5,
+            RejectReason::InternalError => 6,
+            RejectReason::Close => 7,
+            RejectReason::Version => 8,
+            RejectReason::RdvCookie => 9,
+            RejectReason::BadSecret => 10,
+            RejectReason::Unsecure => 11,
+            RejectReason::MessageApi => 12,
+            RejectReason::Congestion => 13,
+            RejectReason::Filter => 14,
+            RejectReason::Group => 15,
+            RejectReason::Timeout => 16,
+            RejectReason::Other(code) => code,
+        }
+    }
+
+    /// The reason for a wire code (total: unknown codes become
+    /// [`RejectReason::Other`], so every value round-trips).
+    #[must_use]
+    pub const fn from_code(code: u32) -> Self {
+        match code {
+            0 => RejectReason::Unknown,
+            1 => RejectReason::System,
+            2 => RejectReason::Peer,
+            3 => RejectReason::Resource,
+            4 => RejectReason::Rogue,
+            5 => RejectReason::Backlog,
+            6 => RejectReason::InternalError,
+            7 => RejectReason::Close,
+            8 => RejectReason::Version,
+            9 => RejectReason::RdvCookie,
+            10 => RejectReason::BadSecret,
+            11 => RejectReason::Unsecure,
+            12 => RejectReason::MessageApi,
+            13 => RejectReason::Congestion,
+            14 => RejectReason::Filter,
+            15 => RejectReason::Group,
+            16 => RejectReason::Timeout,
+            other => RejectReason::Other(other),
+        }
+    }
+}
+
+impl std::fmt::Display for RejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RejectReason::Unknown => write!(f, "unknown reason"),
+            RejectReason::System => write!(f, "system resource failure"),
+            RejectReason::Peer => write!(f, "rejected by peer"),
+            RejectReason::Resource => write!(f, "resource allocation failure"),
+            RejectReason::Rogue => write!(f, "rogue handshake"),
+            RejectReason::Backlog => write!(f, "listener backlog full"),
+            RejectReason::InternalError => write!(f, "internal peer error"),
+            RejectReason::Close => write!(f, "socket closing"),
+            RejectReason::Version => write!(f, "protocol version too old"),
+            RejectReason::RdvCookie => write!(f, "rendezvous cookie collision"),
+            RejectReason::BadSecret => write!(f, "wrong passphrase"),
+            RejectReason::Unsecure => write!(f, "encryption required but not configured"),
+            RejectReason::MessageApi => write!(f, "message api mismatch"),
+            RejectReason::Congestion => write!(f, "congestion controller mismatch"),
+            RejectReason::Filter => write!(f, "packet filter mismatch"),
+            RejectReason::Group => write!(f, "group membership mismatch"),
+            RejectReason::Timeout => write!(f, "peer connect timeout"),
+            RejectReason::Other(code) => write!(f, "code {code}"),
+        }
     }
 }
 

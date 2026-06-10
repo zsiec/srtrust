@@ -7,8 +7,6 @@
 
 mod sim;
 
-use std::time::Duration;
-
 use sim::{LinkConfig, Pair, t0};
 use srt_protocol::connection::{
     CipherMode, Config, Connection, EncryptionSettings, Event, KeySize,
@@ -36,22 +34,16 @@ fn is_km(datagram: &[u8], wanted: u16) -> bool {
 }
 
 fn cipher_config(cipher: CipherMode, km_refresh_rate: u32) -> Config {
-    Config {
-        latency: Duration::from_millis(120),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: Some(EncryptionSettings {
+    // A tiny refresh rate so rotation happens within a short test (the wire
+    // mechanism is identical at the 2^24 default).
+    Config::default()
+        .with_flow_window(8192)
+        .with_encryption(EncryptionSettings {
             passphrase: b"rotate-me-please".to_vec(),
             key_size: KeySize::Aes128,
             cipher,
-        }),
-        max_bw: 0,
-        // A tiny refresh rate so rotation happens within a short test (the wire
-        // mechanism is identical at the 2^24 default).
-        km_refresh_rate,
-        fec: None,
-    }
+        })
+        .with_km_refresh_rate(km_refresh_rate)
 }
 
 fn connected() -> Pair {

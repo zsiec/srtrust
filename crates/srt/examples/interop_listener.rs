@@ -15,20 +15,14 @@ async fn main() {
         .unwrap_or(4200);
     let passphrase = std::env::args().nth(2);
 
-    let config = Config {
-        latency: Duration::from_millis(120),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: passphrase.map(|p| EncryptionSettings {
+    let mut config = Config::default().with_flow_window(8192);
+    if let Some(p) = passphrase {
+        config = config.with_encryption(EncryptionSettings {
             passphrase: p.into_bytes(),
             key_size: KeySize::Aes128,
             cipher: CipherMode::Ctr,
-        }),
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    };
+        });
+    }
 
     let mut listener =
         SrtListener::bind(format!("127.0.0.1:{port}").parse().unwrap(), config).expect("bind");

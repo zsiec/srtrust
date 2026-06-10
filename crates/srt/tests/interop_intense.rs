@@ -17,7 +17,7 @@ mod interop_util;
 use std::time::{Duration, Instant};
 
 use interop_util::*;
-use srt::{CipherMode, Config, SrtListener};
+use srt::{CipherMode, SrtListener};
 use srt_protocol::control::{ControlBody, ControlType};
 use srt_protocol::packet::Packet;
 use tokio::net::UdpSocket;
@@ -239,10 +239,7 @@ async fn lossy_srtrust_to_libsrt(front: u16, backend: u16, sink_port: u16, ciphe
     };
     let counts = spawn_proxy(front, backend, cfg).await;
 
-    let config = Config {
-        latency: Duration::from_millis(1000),
-        ..encrypted(cipher, 0)
-    };
+    let config = encrypted(cipher, 0).with_latency(Duration::from_secs(1));
     let received = srtrust_sender_run(
         config,
         front,
@@ -285,10 +282,7 @@ async fn lossy_libsrt_to_srtrust() {
     let slt = require_libsrt!();
     let (front, backend, in_port) = (19190, 19191, 19192);
 
-    let config = Config {
-        latency: Duration::from_millis(1000),
-        ..encrypted(CipherMode::Ctr, 0)
-    };
+    let config = encrypted(CipherMode::Ctr, 0).with_latency(Duration::from_secs(1));
     let mut listener =
         SrtListener::bind(format!("127.0.0.1:{backend}").parse().unwrap(), config).unwrap();
 
@@ -372,10 +366,7 @@ async fn gcm_retransmit_across_rotation_against_libsrt() {
     };
     let counts = spawn_proxy(front, backend, cfg).await;
 
-    let config = Config {
-        latency: Duration::from_millis(800),
-        ..encrypted(CipherMode::Gcm, 16)
-    };
+    let config = encrypted(CipherMode::Gcm, 16).with_latency(Duration::from_millis(800));
     let received = srtrust_sender_run(
         config,
         front,
@@ -411,10 +402,7 @@ async fn slow_srtrust_reader_throttles_libsrt_sender() {
     let slt = require_libsrt!();
     let (srt_port, in_port) = (19210, 19211);
 
-    let config = Config {
-        flow_window: 1024,
-        ..base_config()
-    };
+    let config = base_config().with_flow_window(1024);
     let mut listener =
         SrtListener::bind(format!("127.0.0.1:{srt_port}").parse().unwrap(), config).unwrap();
     let mut child = spawn_slt(
@@ -516,10 +504,7 @@ async fn stream_id_is_accepted_by_libsrt() {
     );
     tokio::time::sleep(Duration::from_millis(1300)).await;
 
-    let config = Config {
-        stream_id: Some("#!::r=interop/probe,m=publish".to_string()),
-        ..base_config()
-    };
+    let config = base_config().with_stream_id("#!::r=interop/probe,m=publish");
     let received = srtrust_sender_run(
         config,
         srt_port,

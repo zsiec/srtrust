@@ -16,18 +16,12 @@ use srt_protocol::seq::SeqNumber;
 const GROUP: usize = 4;
 
 fn config() -> Config {
-    Config {
-        latency: Duration::from_secs(1),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        // Both peers agree on the same group geometry out of band (handshake
-        // negotiation is future work); the accepted side inherits this config.
-        fec: Some(FecConfig { group_size: GROUP }),
-    }
+    // Both peers agree on the same group geometry out of band (handshake
+    // negotiation is future work); the accepted side inherits this config.
+    Config::default()
+        .with_latency(Duration::from_secs(1))
+        .with_flow_window(8192)
+        .with_fec(FecConfig { group_size: GROUP })
 }
 
 fn connected(c2l: LinkConfig, l2c: LinkConfig, seed: u64) -> Pair {

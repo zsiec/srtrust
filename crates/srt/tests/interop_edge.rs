@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use interop_util::*;
-use srt::{CipherMode, Config, EncryptionSettings, KeySize, SrtListener, connect};
+use srt::{
+    CipherMode, ConnectionError, EncryptionSettings, KeySize, RejectReason, SrtListener, connect,
+};
 use srt_protocol::handshake::HandshakeType;
 use srt_protocol::packet::Packet;
 use tokio::net::UdpSocket;
@@ -80,10 +82,7 @@ async fn burst_loss_of_srtrust_data_recovers_via_libsrt_range_nak() {
     };
     let counts = spawn_proxy(front, backend, cfg).await;
 
-    let config = Config {
-        latency: Duration::from_millis(1500),
-        ..encrypted(CipherMode::Ctr, 0)
-    };
+    let config = encrypted(CipherMode::Ctr, 0).with_latency(Duration::from_millis(1500));
     let received = srtrust_sender_run(
         config,
         front,
@@ -118,10 +117,7 @@ async fn burst_loss_of_libsrt_data_recovers_via_srtrust_range_nak() {
     let slt = require_libsrt!();
     let (front, backend, in_port) = (19310, 19311, 19312);
 
-    let config = Config {
-        latency: Duration::from_millis(1500),
-        ..encrypted(CipherMode::Ctr, 0)
-    };
+    let config = encrypted(CipherMode::Ctr, 0).with_latency(Duration::from_millis(1500));
     let mut listener =
         SrtListener::bind(format!("127.0.0.1:{backend}").parse().unwrap(), config).unwrap();
 
@@ -302,22 +298,35 @@ async fn wrong_passphrase_fails_cleanly() {
     );
     tokio::time::sleep(Duration::from_millis(1300)).await;
 
+    let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(
         Duration::from_secs(6),
         connect(
-            "127.0.0.1:0".parse().unwrap(),
-            format!("127.0.0.1:{srt_port}").parse().unwrap(),
+            format!("127.0.0.1:{srt_port}"),
             encrypted(CipherMode::Ctr, 0),
         ),
     )
     .await;
+    let elapsed = started.elapsed();
     let _ = child.kill();
     let _ = child.wait();
 
-    let completed = outcome.expect("must resolve within 6s, not hang");
+    // libsrt answers the conclusion with a URQ_FAILURE rejection (BadSecret),
+    // so the caller must fail fast with the typed reason — not retry into its
+    // 3 s connect timeout.
+    let error = outcome
+        .expect("must resolve within 6s, not hang")
+        .expect_err("a wrong passphrase must fail the handshake");
     assert!(
-        completed.is_err(),
-        "a wrong passphrase must fail the handshake"
+        matches!(
+            error,
+            srt::Error::Protocol(ConnectionError::Rejected(RejectReason::BadSecret))
+        ),
+        "expected Rejected(BadSecret), got {error:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the rejection must end the attempt promptly, took {elapsed:?}"
     );
 }
 
@@ -340,19 +349,21 @@ async fn plain_caller_rejected_by_enforced_encrypted_libsrt() {
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(6),
-        connect(
-            "127.0.0.1:0".parse().unwrap(),
-            format!("127.0.0.1:{srt_port}").parse().unwrap(),
-            base_config(),
-        ),
+        connect(format!("127.0.0.1:{srt_port}"), base_config()),
     )
     .await;
     let _ = child.kill();
     let _ = child.wait();
 
+    let error = outcome
+        .expect("must resolve, not hang")
+        .expect_err("an unencrypted caller must be rejected by an enforced encrypted listener");
     assert!(
-        outcome.expect("must resolve, not hang").is_err(),
-        "an unencrypted caller must be rejected by an enforced encrypted listener"
+        matches!(
+            error,
+            srt::Error::Protocol(ConnectionError::Rejected(RejectReason::Unsecure))
+        ),
+        "expected Rejected(Unsecure), got {error:?}"
     );
 }
 
@@ -372,8 +383,7 @@ async fn encrypted_caller_to_plain_unenforced_libsrt_delivers_nothing() {
     tokio::time::sleep(Duration::from_millis(1300)).await;
 
     let stream = connect(
-        "127.0.0.1:0".parse().unwrap(),
-        format!("127.0.0.1:{srt_port}").parse().unwrap(),
+        format!("127.0.0.1:{srt_port}"),
         encrypted(CipherMode::Ctr, 0),
     )
     .await
@@ -464,14 +474,11 @@ async fn aes_size_run(srt_port: u16, sink_port: u16, key_size: KeySize, cipher: 
     );
     tokio::time::sleep(Duration::from_millis(1300)).await;
 
-    let config = Config {
-        encryption: Some(EncryptionSettings {
-            passphrase: PASSPHRASE.as_bytes().to_vec(),
-            key_size,
-            cipher,
-        }),
-        ..base_config()
-    };
+    let config = base_config().with_encryption(EncryptionSettings {
+        passphrase: PASSPHRASE.as_bytes().to_vec(),
+        key_size,
+        cipher,
+    });
     let received = srtrust_sender_run(
         config,
         srt_port,
@@ -527,13 +534,9 @@ async fn idle_connection_survives_libsrt_peer_idle_timeout() {
     );
     tokio::time::sleep(Duration::from_millis(1300)).await;
 
-    let stream = connect(
-        "127.0.0.1:0".parse().unwrap(),
-        format!("127.0.0.1:{srt_port}").parse().unwrap(),
-        base_config(),
-    )
-    .await
-    .expect("connect");
+    let stream = connect(format!("127.0.0.1:{srt_port}"), base_config())
+        .await
+        .expect("connect");
     for i in 0..3u32 {
         stream.send(Bytes::from(msg(i, 64))).await.expect("send");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -570,13 +573,9 @@ async fn srtrust_graceful_close_ends_libsrt_promptly() {
     );
     tokio::time::sleep(Duration::from_millis(1300)).await;
 
-    let stream = connect(
-        "127.0.0.1:0".parse().unwrap(),
-        format!("127.0.0.1:{srt_port}").parse().unwrap(),
-        base_config(),
-    )
-    .await
-    .expect("connect");
+    let stream = connect(format!("127.0.0.1:{srt_port}"), base_config())
+        .await
+        .expect("connect");
     for i in 0..5u32 {
         stream.send(Bytes::from(msg(i, 64))).await.expect("send");
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -760,8 +759,7 @@ async fn ctr_payload_exactly_1316_round_trips() {
     tokio::time::sleep(Duration::from_millis(1300)).await;
 
     let stream = connect(
-        "127.0.0.1:0".parse().unwrap(),
-        format!("127.0.0.1:{srt_port}").parse().unwrap(),
+        format!("127.0.0.1:{srt_port}"),
         encrypted(CipherMode::Ctr, 0),
     )
     .await
@@ -845,8 +843,7 @@ async fn oversize_message_is_partially_lost_at_libsrt_but_connection_survives() 
     tokio::time::sleep(Duration::from_millis(1300)).await;
 
     let stream = connect(
-        "127.0.0.1:0".parse().unwrap(),
-        format!("127.0.0.1:{srt_port}").parse().unwrap(),
+        format!("127.0.0.1:{srt_port}"),
         encrypted(CipherMode::Ctr, 0),
     )
     .await
@@ -962,13 +959,9 @@ async fn duplex_echo_against_libsrt_message_echo() {
     );
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    let mut stream = connect(
-        "127.0.0.1:0".parse().unwrap(),
-        format!("127.0.0.1:{srt_port}").parse().unwrap(),
-        base_config(),
-    )
-    .await
-    .expect("srtrust connects to the libsrt echo");
+    let mut stream = connect(format!("127.0.0.1:{srt_port}"), base_config())
+        .await
+        .expect("srtrust connects to the libsrt echo");
 
     let total = 30u32;
     let mut echoed: Vec<Vec<u8>> = Vec::new();
@@ -1061,10 +1054,7 @@ async fn libsrt_stats_reconcile_with_ours() {
     };
     let counts = spawn_proxy(front, backend, cfg).await;
 
-    let config = Config {
-        latency: Duration::from_millis(300),
-        ..base_config()
-    };
+    let config = base_config().with_latency(Duration::from_millis(300));
     let received = srtrust_sender_run(
         config,
         front,
@@ -1343,11 +1333,7 @@ async fn lost_conclusion_response_fails_cleanly_against_single_accept_libsrt() {
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(6),
-        connect(
-            "127.0.0.1:0".parse().unwrap(),
-            format!("127.0.0.1:{front}").parse().unwrap(),
-            base_config(),
-        ),
+        connect(format!("127.0.0.1:{front}"), base_config()),
     )
     .await;
     let _ = child.kill();
@@ -1389,8 +1375,7 @@ async fn soak_45_minutes_across_the_timestamp_wrap() {
     tokio::time::sleep(Duration::from_millis(1300)).await;
 
     let stream = connect(
-        "127.0.0.1:0".parse().unwrap(),
-        format!("127.0.0.1:{srt_port}").parse().unwrap(),
+        format!("127.0.0.1:{srt_port}"),
         encrypted(CipherMode::Ctr, 0),
     )
     .await
@@ -1421,4 +1406,70 @@ async fn soak_45_minutes_across_the_timestamp_wrap() {
     let _ = child.wait();
 
     assert_all_in_order(&received, total, "45-minute soak across the wrap");
+}
+
+// ---- 8. the connection-request API against a real libsrt caller ----
+
+/// A libsrt caller advertises a Stream ID; the srtrust listener inspects it via
+/// `incoming()`, rejects the unauthorized one with an application code, and
+/// accepts the authorized one — which then delivers data. The decision loop and
+/// the user-range rejection must both hold up against the real implementation.
+#[tokio::test]
+async fn libsrt_streamid_inspected_rejected_then_accepted() {
+    let slt = require_libsrt!();
+    let (srt_port, in_bad, in_good) = (19440, 19441, 19442);
+
+    let mut listener = SrtListener::bind(
+        format!("127.0.0.1:{srt_port}").parse().unwrap(),
+        base_config(),
+    )
+    .unwrap();
+
+    // An unauthorized caller: surfaced with its Stream ID, then rejected.
+    let mut bad = spawn_slt(
+        &slt,
+        &format!("udp://127.0.0.1:{in_bad}"),
+        &format!("srt://127.0.0.1:{srt_port}?latency=120&streamid=live/intruder"),
+    );
+    let request = tokio::time::timeout(Duration::from_secs(5), listener.incoming())
+        .await
+        .expect("the libsrt caller's request surfaces")
+        .expect("listener alive");
+    assert_eq!(
+        request.stream_id(),
+        Some("live/intruder"),
+        "the libsrt caller's Stream ID is surfaced verbatim"
+    );
+    request
+        .reject(RejectReason::Other(2403)) // libsrt's user-defined range
+        .await
+        .expect("reject reaches the driver");
+    let _ = bad.kill();
+    let _ = bad.wait();
+
+    // An authorized caller on the same listener: accepted, and data flows.
+    let mut good = spawn_slt(
+        &slt,
+        &format!("udp://127.0.0.1:{in_good}"),
+        &format!("srt://127.0.0.1:{srt_port}?latency=120&streamid=live/cam1"),
+    );
+    let request = tokio::time::timeout(Duration::from_secs(8), listener.incoming())
+        .await
+        .expect("the authorized caller's request surfaces")
+        .expect("listener alive");
+    assert_eq!(request.stream_id(), Some("live/cam1"));
+    let mut server = request.accept().await.expect("accept");
+
+    let feeder = tokio::spawn(feed_libsrt_input(
+        in_good,
+        10,
+        Duration::from_millis(10),
+        64,
+    ));
+    let received = recv_indices(&mut server, 10, Duration::from_secs(3)).await;
+    let _ = feeder.await;
+    let _ = good.kill();
+    let _ = good.wait();
+
+    assert_all_in_order(&received, 10, "after a rejection on the same listener");
 }

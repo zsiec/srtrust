@@ -15,29 +15,17 @@ async fn main() {
         .unwrap_or_else(|| "127.0.0.1:4200".to_string());
     let passphrase = std::env::args().nth(2);
 
-    let config = Config {
-        latency: Duration::from_millis(120),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: passphrase.map(|p| EncryptionSettings {
+    let mut config = Config::default().with_flow_window(8192);
+    if let Some(p) = passphrase {
+        config = config.with_encryption(EncryptionSettings {
             passphrase: p.into_bytes(),
             key_size: KeySize::Aes128,
             cipher: CipherMode::Ctr,
-        }),
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    };
+        });
+    }
 
     eprintln!("[srtrust] connecting to {remote} ...");
-    let stream = match connect(
-        "127.0.0.1:0".parse().unwrap(),
-        remote.parse().expect("valid addr"),
-        config,
-    )
-    .await
-    {
+    let stream = match connect(remote.as_str(), config).await {
         Ok(s) => {
             eprintln!("[srtrust] connected, handshake complete");
             s

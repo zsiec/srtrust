@@ -13,16 +13,9 @@ use srt_protocol::packet::SocketId;
 use srt_protocol::seq::SeqNumber;
 
 fn config() -> Config {
-    Config {
-        latency: Duration::from_secs(1),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    Config::default()
+        .with_latency(Duration::from_secs(1))
+        .with_flow_window(8192)
 }
 
 fn connected(c2l: LinkConfig, l2c: LinkConfig, seed: u64) -> Pair {
@@ -141,4 +134,59 @@ fn retransmissions_are_counted_on_a_lossy_link() {
         u64::from(n),
         "n unique delivered"
     );
+}
+
+#[test]
+fn counters_track_acks_naks_and_negotiated_latency() {
+    // 30% loss caller→listener: the receiver must NAK, the sender must hear
+    // those NAKs, and ACKs flow back the whole time.
+    let lossy = LinkConfig {
+        loss: 0.3,
+        ..LinkConfig::PERFECT
+    };
+    let mut pair = connected(lossy, LinkConfig::PERFECT, 7);
+    let n = 40u8;
+    for i in 0..n {
+        pair.caller_send(&[i; 100]);
+    }
+    assert!(pair.run_until(|p| p.accepted_received().len() == usize::from(n), 50_000));
+
+    let caller = pair.caller_stats();
+    let accepted = pair.accepted_stats().expect("accepted exists");
+    assert!(caller.acks_received >= 1, "the sender heard ACKs");
+    assert!(caller.naks_received >= 1, "the sender heard loss reports");
+    assert!(accepted.acks_sent >= 1, "the receiver sent ACKs");
+    assert!(accepted.naks_sent >= 1, "the receiver sent loss reports");
+    assert_eq!(
+        caller.acks_received, accepted.acks_sent,
+        "every ACK the receiver sent arrived (the l2c link is perfect)"
+    );
+
+    // Both sides advertised 1 s, so both negotiated 1 s (spec §4.3.1.2).
+    assert_eq!(caller.latency_ms, 1000);
+    assert_eq!(accepted.latency_ms, 1000);
+}
+
+#[test]
+fn send_buffer_gauge_tracks_the_unacknowledged_backlog() {
+    let mut pair = connected(LinkConfig::PERFECT, LinkConfig::PERFECT, 1);
+
+    // Cut both links: sends queue up with no way to be acknowledged.
+    let dead = LinkConfig {
+        loss: 1.0,
+        ..LinkConfig::PERFECT
+    };
+    pair.degrade_links(dead, dead, 9);
+    for i in 0..5u8 {
+        pair.caller_send(&[i; 100]);
+    }
+    assert!(
+        pair.caller_stats().send_buffer_packets >= 5,
+        "unacknowledged data shows in the send-buffer gauge, got {}",
+        pair.caller_stats().send_buffer_packets
+    );
+
+    // Heal the links and let everything deliver + acknowledge: gauge drains.
+    pair.degrade_links(LinkConfig::PERFECT, LinkConfig::PERFECT, 10);
+    assert!(pair.run_until(|p| p.caller_stats().send_buffer_packets == 0, 50_000));
 }

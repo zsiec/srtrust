@@ -12,19 +12,12 @@ use srt_protocol::packet::{Packet, SocketId};
 use srt_protocol::seq::SeqNumber;
 
 fn config() -> Config {
-    Config {
-        // A generous latency so retransmissions (incl. the 300 ms EXP backstop)
-        // arrive within the TSBPD play-out budget rather than being dropped as
-        // too-late. Live SRT likewise sets latency well above the recovery time.
-        latency: Duration::from_secs(1),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    // A generous latency so retransmissions (incl. the 300 ms EXP backstop)
+    // arrive within the TSBPD play-out budget rather than being dropped as
+    // too-late. Live SRT likewise sets latency well above the recovery time.
+    Config::default()
+        .with_latency(Duration::from_secs(1))
+        .with_flow_window(8192)
 }
 
 fn caller(now: std::time::Instant) -> Connection {
@@ -243,10 +236,7 @@ fn tail_loss_is_recovered_by_the_exp_timer() {
     // fits inside it — otherwise send-side TLPKTDROP would (correctly) shed a
     // packet whose recovery takes longer than `latency`.
     let now = t0();
-    let cfg = Config {
-        latency: Duration::from_secs(5),
-        ..config()
-    };
+    let cfg = config().with_latency(Duration::from_secs(5));
     let caller = Connection::connect(
         cfg.clone(),
         SocketId::new(0x11),

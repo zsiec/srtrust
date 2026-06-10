@@ -27,21 +27,13 @@ events (data delivered, connection state) and `poll_output()` for wire/timer
 effects you must perform.
 
 ```rust,no_run
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use srt_protocol::connection::{Config, Connection, Output};
 use srt_protocol::packet::SocketId;
 use srt_protocol::seq::SeqNumber;
 
-let config = Config {
-    latency: Duration::from_millis(120),
-    mtu: 1500,
-    flow_window: 8192,
-    stream_id: None,
-    encryption: None,
-    max_bw: 0,
-    km_refresh_rate: 0,
-    fec: None,
-};
+// Config::default() is deployment-ready; refine it with the with_* builders.
+let config = Config::default();
 
 // `Instant::now()` lives in *your* code — never inside the core.
 let mut conn = Connection::connect(

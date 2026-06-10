@@ -8,27 +8,17 @@ use bytes::Bytes;
 use srt::{CipherMode, Config, EncryptionSettings, KeySize, SrtListener, connect};
 
 fn config() -> Config {
-    Config {
-        latency: Duration::from_millis(120),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    Config::default()
+        .with_latency(Duration::from_millis(120))
+        .with_flow_window(8192)
 }
 
 fn encrypted_config(passphrase: &[u8]) -> Config {
-    Config {
-        encryption: Some(EncryptionSettings {
-            passphrase: passphrase.to_vec(),
-            key_size: KeySize::Aes128,
-            cipher: CipherMode::Ctr,
-        }),
-        ..config()
-    }
+    config().with_encryption(EncryptionSettings {
+        passphrase: passphrase.to_vec(),
+        key_size: KeySize::Aes128,
+        cipher: CipherMode::Ctr,
+    })
 }
 
 async fn run_round_trip(make_config: fn() -> Config) {
@@ -36,9 +26,7 @@ async fn run_round_trip(make_config: fn() -> Config) {
     let addr = listener.local_addr();
 
     let caller = tokio::spawn(async move {
-        let stream = connect("127.0.0.1:0".parse().unwrap(), addr, make_config())
-            .await
-            .expect("caller connects");
+        let stream = connect(addr, make_config()).await.expect("caller connects");
         for i in 0..5u8 {
             stream.send(Bytes::from(vec![i; 200])).await.expect("send");
         }
@@ -77,9 +65,7 @@ async fn one_listener_accepts_many_concurrent_callers() {
     let callers: Vec<_> = (0..3u8)
         .map(|id| {
             tokio::spawn(async move {
-                let stream = connect("127.0.0.1:0".parse().unwrap(), addr, config())
-                    .await
-                    .expect("caller connects");
+                let stream = connect(addr, config()).await.expect("caller connects");
                 for seq in 0..4u8 {
                     stream
                         .send(Bytes::from(vec![id; (seq as usize + 1) * 50]))
@@ -143,9 +129,7 @@ async fn stats_report_the_transfer() {
     let addr = listener.local_addr();
 
     let caller = tokio::spawn(async move {
-        let stream = connect("127.0.0.1:0".parse().unwrap(), addr, config())
-            .await
-            .expect("connect");
+        let stream = connect(addr, config()).await.expect("connect");
         for _ in 0..10u8 {
             stream
                 .send(Bytes::from(vec![7u8; 300]))
@@ -189,9 +173,7 @@ async fn receive_rate_tracks_the_stream_not_burst_speed() {
     let addr = listener.local_addr();
 
     let caller = tokio::spawn(async move {
-        let stream = connect("127.0.0.1:0".parse().unwrap(), addr, config())
-            .await
-            .expect("connect");
+        let stream = connect(addr, config()).await.expect("connect");
         for _ in 0..COUNT {
             stream
                 .send(Bytes::from(vec![3u8; 800]))

@@ -46,16 +46,13 @@ fn config() -> Config {
                 CipherMode::Ctr
             },
         });
-    Config {
-        latency: Duration::from_millis(120),
-        mtu: 1500,
-        flow_window,
-        stream_id: None,
-        encryption,
-        max_bw,
-        km_refresh_rate: 0,
-        fec: None,
+    let mut config = Config::default()
+        .with_flow_window(flow_window)
+        .with_max_bw(max_bw);
+    if let Some(enc) = encryption {
+        config = config.with_encryption(enc);
     }
+    config
 }
 
 fn report(label: &str, bytes: u64, elapsed: Duration, payload: usize) {
@@ -110,9 +107,7 @@ async fn loopback(secs: u64, payload: usize) {
         }
     });
 
-    let stream = connect("127.0.0.1:0".parse().unwrap(), addr, config())
-        .await
-        .expect("connect");
+    let stream = connect(addr, config()).await.expect("connect");
     let buf = Bytes::from(vec![0xABu8; payload]);
     let start = Instant::now();
     let mut sent = 0u64;
@@ -138,9 +133,7 @@ async fn loopback(secs: u64, payload: usize) {
 }
 
 async fn sender(addr: std::net::SocketAddr, secs: u64, payload: usize) {
-    let stream = connect("0.0.0.0:0".parse().unwrap(), addr, config())
-        .await
-        .expect("connect");
+    let stream = connect(addr, config()).await.expect("connect");
     let buf = Bytes::from(vec![0xABu8; payload]);
     let start = Instant::now();
     let mut sent = 0u64;

@@ -34,16 +34,9 @@ fn srt_live_transmit() -> Option<String> {
 }
 
 fn base_config() -> Config {
-    Config {
-        latency: Duration::from_millis(120),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    Config::default()
+        .with_latency(Duration::from_millis(120))
+        .with_flow_window(8192)
 }
 
 /// Spawns a C `srt-live-transmit` listener that forwards received payload as UDP
@@ -111,23 +104,17 @@ async fn caller_to_c_n(
     let mut child = spawn_c_listener(&slt, srt_port, udp_port, passphrase, gcm);
     tokio::time::sleep(Duration::from_millis(1300)).await; // let the C listener bind
 
-    let config = Config {
-        encryption: passphrase.map(|p| EncryptionSettings {
+    let mut config = base_config().with_km_refresh_rate(km_refresh);
+    if let Some(p) = passphrase {
+        config = config.with_encryption(EncryptionSettings {
             passphrase: p.as_bytes().to_vec(),
             key_size: KeySize::Aes128,
             cipher,
-        }),
-        km_refresh_rate: km_refresh,
-        fec: None,
-        ..base_config()
-    };
-    let stream = connect(
-        "127.0.0.1:0".parse().unwrap(),
-        format!("127.0.0.1:{srt_port}").parse().unwrap(),
-        config,
-    )
-    .await
-    .expect("srtrust caller connects to the libsrt listener");
+        });
+    }
+    let stream = connect(format!("127.0.0.1:{srt_port}"), config)
+        .await
+        .expect("srtrust caller connects to the libsrt listener");
 
     for i in 0..messages {
         stream

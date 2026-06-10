@@ -78,19 +78,11 @@ const EXT_KMRSP: u16 = 4;
 
 /// Interval between handshake retransmissions (libsrt's SYN interval).
 const SYN_INTERVAL: Duration = Duration::from_millis(250);
-/// How long the Caller keeps retrying the handshake before giving up.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-/// How long a graceful close lingers waiting for the send buffer to drain before
-/// forcing the SHUTDOWN out anyway (the peer may have vanished). libsrt's default
-/// linger is also a few seconds.
-const LINGER_TIMEOUT: Duration = Duration::from_secs(3);
 /// Default key-refresh rate: rotate the SEK every 2²⁴ packets (libsrt's default,
 /// spec §6.1.6), bounding how much data is ever encrypted under one key.
 pub const KM_REFRESH_DEFAULT: u32 = 1 << 24;
-/// How long an established connection waits for *any* packet from the peer before
-/// declaring it dead (libsrt's `SRTO_PEERIDLETIMEO`, default 5 s). Keepalives keep
-/// an otherwise-idle peer well inside this window.
-const PEER_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+// The connect, linger, and peer-idle timeouts are `Config` fields
+// (`connect_timeout`, `linger`, `peer_idle_timeout`), not constants.
 
 /// One outgoing data packet's worth of an application message: a payload chunk,
 /// its position within the message, and the message number it belongs to. A
@@ -303,7 +295,7 @@ pub struct Connection {
     /// a KEEPALIVE so an idle-timeout-enforcing peer does not drop us (spec §3.2.6).
     last_sent: Instant,
     /// When we last *received* any packet from the peer. Drives the idle / dead-peer
-    /// timeout: if nothing arrives for [`PEER_IDLE_TIMEOUT`], the peer is gone.
+    /// timeout: if nothing arrives for `config.peer_idle_timeout`, the peer is gone.
     last_recv_any: Instant,
     /// Reassembles received fragments back into application messages.
     reassembler: Reassembler,
@@ -451,6 +443,19 @@ impl Connection {
     /// not met — a missing KMREQ, or a Key Material the listener's passphrase
     /// cannot unwrap (wrong passphrase). The listener then declines the
     /// connection rather than establishing an undecryptable one.
+    /// Checks whether a caller conclusion *would* be accepted — the crypto
+    /// gate of [`Connection::accept`] without constructing anything. The
+    /// listener's deferred mode runs this up front so a doomed conclusion is
+    /// rejected immediately instead of being surfaced to the application.
+    /// (The passphrase key derivation runs again on the eventual accept;
+    /// that double PBKDF2 is the price of parking no key state.)
+    pub(crate) fn validate_accept(
+        config: &Config,
+        caller_hs: &Handshake,
+    ) -> Result<(), ConnectionError> {
+        accept_crypto(config.encryption.as_ref(), caller_hs).map(|_| ())
+    }
+
     pub(crate) fn accept(
         config: Config,
         local_socket_id: SocketId,
@@ -543,7 +548,16 @@ impl Connection {
                     ..
                 }) = packet
                 {
-                    if matches!(self.state, State::Induction) {
+                    // A rejection (URQ_FAILURE, spec §4.3 Table 7) ends the
+                    // attempt at once — retrying cannot succeed.
+                    if let Some(reason) = hs.handshake_type.reject_reason() {
+                        self.state = State::Failed;
+                        self.outputs.push_back(Output::ClearTimer {
+                            id: TimerId::Handshake,
+                        });
+                        self.events
+                            .push_back(Event::Failed(ConnectionError::Rejected(reason)));
+                    } else if matches!(self.state, State::Induction) {
                         self.on_induction_response(&hs, now);
                     } else {
                         self.on_conclusion_response(&hs, now);
@@ -628,7 +642,7 @@ impl Connection {
         if !matches!(self.state, State::Induction | State::Conclusion) {
             return;
         }
-        if now.saturating_duration_since(self.start) >= CONNECT_TIMEOUT {
+        if now.saturating_duration_since(self.start) >= self.config.connect_timeout {
             self.state = State::Failed;
             self.outputs.push_back(Output::ClearTimer {
                 id: TimerId::Handshake,
@@ -768,7 +782,7 @@ impl Connection {
             self.closing = true;
             self.outputs.push_back(Output::SetTimer {
                 id: TimerId::Linger,
-                after: LINGER_TIMEOUT,
+                after: self.config.linger,
             });
         }
     }
@@ -821,6 +835,9 @@ impl Connection {
         stats.recv_rate_pps = pps;
         stats.recv_rate_bps = bps;
         stats.link_capacity_pps = self.rate.peak_rate();
+        stats.send_buffer_packets =
+            u32::try_from(self.send_buffer.len() + self.send_queue.len()).unwrap_or(u32::MAX);
+        stats.latency_ms = u32::try_from(self.latency.as_millis()).unwrap_or(u32::MAX);
         stats
     }
 

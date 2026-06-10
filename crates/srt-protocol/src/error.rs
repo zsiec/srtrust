@@ -19,10 +19,10 @@ pub enum ConnectionError {
     #[error("connection timed out: no packets from the peer")]
     Timeout,
 
-    /// The peer rejected the handshake, carrying the rejection reason code
+    /// The peer rejected the handshake, carrying the reason it sent
     /// (spec §4.3, Table 7 of handshake rejection reasons).
-    #[error("peer rejected handshake: code {0}")]
-    Rejected(u32),
+    #[error("peer rejected handshake: {0}")]
+    Rejected(crate::handshake::RejectReason),
 
     /// The local application called a method the current state forbids (e.g.
     /// sending on a connection that is not yet established or already closed).
@@ -37,6 +37,52 @@ pub enum ConnectionError {
     /// material).
     #[error(transparent)]
     Crypto(#[from] CryptoError),
+}
+
+/// An invalid [`Config`](crate::connection::Config) value, caught by
+/// [`Config::validate`](crate::connection::Config::validate) before any
+/// packet leaves — each limit here is one a peer (or the protocol itself)
+/// would otherwise enforce as a silent handshake failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    /// TSBPD latency below the protocol's useful floor.
+    #[error("latency below the {min_ms} ms minimum")]
+    LatencyTooLow {
+        /// The enforced floor in milliseconds.
+        min_ms: u64,
+    },
+
+    /// MTU outside the 76–1500 byte range SRT can carry over UDP/IP.
+    #[error("mtu {mtu} outside the supported 76–1500 byte range")]
+    MtuOutOfRange {
+        /// The rejected value.
+        mtu: u32,
+    },
+
+    /// Flow window too small to sustain a connection (libsrt's `SRTO_FC` floor).
+    #[error("flow window below the {min}-packet minimum")]
+    FlowWindowTooSmall {
+        /// The enforced floor in packets.
+        min: u32,
+    },
+
+    /// Passphrase outside libsrt's accepted 10–79 byte range — a peer running
+    /// libsrt would refuse the handshake.
+    #[error("passphrase length {len} outside the accepted 10–79 byte range")]
+    PassphraseLength {
+        /// The rejected length in bytes.
+        len: usize,
+    },
+
+    /// Connect timeout too short for even one handshake round trip.
+    #[error("connect timeout below the 100 ms minimum")]
+    ConnectTimeoutTooLow,
+
+    /// Peer-idle timeout shorter than the keepalive period; every healthy
+    /// connection would be declared dead.
+    #[error("peer idle timeout below the 1 s minimum")]
+    PeerIdleTimeoutTooLow,
 }
 
 /// Failure in the encryption layer (spec §3.2.2, §6): Key Material decoding, key
@@ -93,6 +139,11 @@ pub enum CryptoError {
     /// An encrypted connection was required but the peer supplied no Key Material.
     #[error("no key material provided for an encrypted connection")]
     MissingKeyMaterial,
+
+    /// The peer offered Key Material but this side is configured without
+    /// encryption — exactly one side wants the connection secured.
+    #[error("peer key material offered on an unencrypted connection")]
+    UnexpectedKeyMaterial,
 }
 
 /// Failure while decoding a packet from raw bytes (spec §3).

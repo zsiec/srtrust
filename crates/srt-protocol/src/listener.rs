@@ -20,7 +20,10 @@ use bytes::Bytes;
 
 use crate::connection::{Config, Connection, encode_control};
 use crate::control::ControlBody;
-use crate::handshake::{EncryptionField, Handshake, HandshakeType};
+use crate::error::{ConnectionError, CryptoError};
+use crate::handshake::{
+    EncryptionField, Handshake, HandshakeExtension, HandshakeType, RejectReason,
+};
 use crate::packet::{Packet, SocketId};
 use crate::seq::SeqNumber;
 use crate::timestamp::Timestamp;
@@ -32,6 +35,44 @@ const HS_VERSION_SRT: u32 = 5;
 /// Cookie validity granularity: one minute (spec §4.3.1.1). A conclusion is
 /// accepted if its cookie matches the current or the previous minute's value.
 const COOKIE_QUANTUM: Duration = Duration::from_secs(60);
+/// How long a deferred conclusion stays pending awaiting the application's
+/// accept/reject decision. Generous next to a caller's connect timeout (default
+/// 3 s) — an entry usually dies because the caller gave up, not because of this.
+const PENDING_TTL: Duration = Duration::from_secs(30);
+
+/// A connection attempt awaiting the application's decision (deferred-accept
+/// mode, [`Listener::defer_accepts`]): the parsed conclusion and when it
+/// arrived, keyed by the caller's address.
+#[derive(Debug)]
+struct PendingConn {
+    from: SocketAddr,
+    conclusion: Handshake,
+    since: Instant,
+}
+
+/// A surfaced connection request: who is calling and what they asked for
+/// (spec §3.2.1.3 — the Stream ID carries the resource/credentials the
+/// accept/reject decision needs). Drained from [`Listener::poll_request`];
+/// answer it with [`Listener::accept_pending`] or [`Listener::reject_pending`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnRequest {
+    remote_addr: SocketAddr,
+    stream_id: Option<String>,
+}
+
+impl ConnRequest {
+    /// The caller's address — the key for `accept_pending`/`reject_pending`.
+    #[must_use]
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
+    }
+
+    /// The Stream ID the caller advertised, if any (spec §3.2.1.3).
+    #[must_use]
+    pub fn stream_id(&self) -> Option<&str> {
+        self.stream_id.as_deref()
+    }
+}
 
 /// A listening SRT endpoint that accepts caller connections (spec §4.3.1).
 #[derive(Debug)]
@@ -47,6 +88,15 @@ pub struct Listener {
     /// Connections accepted on a valid conclusion, awaiting
     /// [`Listener::poll_accept`].
     accepted: VecDeque<Connection>,
+    /// Deferred-accept mode ([`Listener::defer_accepts`]): valid conclusions
+    /// are parked in `pending` and surfaced via `requests` instead of being
+    /// accepted automatically.
+    deferred: bool,
+    /// Parked conclusions awaiting the application's decision (one per peer
+    /// address; retransmissions refresh, never duplicate).
+    pending: Vec<PendingConn>,
+    /// Surfaced requests awaiting [`Listener::poll_request`].
+    requests: VecDeque<ConnRequest>,
 }
 
 impl Listener {
@@ -70,13 +120,29 @@ impl Listener {
             start: now,
             responses: VecDeque::new(),
             accepted: VecDeque::new(),
+            deferred: false,
+            pending: Vec::new(),
+            requests: VecDeque::new(),
         }
+    }
+
+    /// Switches to deferred-accept mode: instead of accepting every valid
+    /// conclusion automatically, the listener parks it and surfaces a
+    /// [`ConnRequest`] from [`Listener::poll_request`]; the application then
+    /// calls [`Listener::accept_pending`] or [`Listener::reject_pending`].
+    /// Crypto mismatches are still rejected immediately and never surfaced.
+    pub fn defer_accepts(&mut self) {
+        self.deferred = true;
     }
 
     /// Feeds one received datagram, tagged with the peer address it came `from`
     /// (needed to craft and later validate the SYN cookie). May enqueue a
     /// response and, on a valid conclusion, an accepted connection.
     pub fn feed_recv_buf(&mut self, datagram: &[u8], from: SocketAddr, now: Instant) {
+        // Lazily expire parked conclusions whose caller has long since given up
+        // (deferred mode; entries are few, this is a cheap retain).
+        self.pending
+            .retain(|p| now.saturating_duration_since(p.since) < PENDING_TTL);
         let Ok(Packet::Control(ctrl)) = Packet::decode(datagram) else {
             return;
         };
@@ -116,22 +182,143 @@ impl Listener {
     }
 
     /// Validates a conclusion's cookie and, if it checks out, spawns the accepted
-    /// connection (spec §4.3.1.2). An invalid cookie — or an encryption mismatch
-    /// (wrong passphrase / missing key material) — is silently dropped, leaving
-    /// the caller to time out.
+    /// connection (spec §4.3.1.2). An invalid cookie is silently dropped — the
+    /// cookie is the anti-DoS gate, and an attacker earns no response. An
+    /// encryption mismatch (wrong passphrase, or only one side encrypting) is
+    /// answered with a `URQ_FAILURE` rejection (spec §4.3, Table 7) so the
+    /// caller fails fast instead of retrying into its connect timeout.
     fn on_conclusion(&mut self, conclusion: &Handshake, from: SocketAddr, now: Instant) {
         if !self.cookie_valid(conclusion.syn_cookie, from, now) {
             return;
         }
-        if let Ok(conn) = Connection::accept(
+        if self.deferred {
+            self.park_conclusion(conclusion, from, now);
+            return;
+        }
+        match Connection::accept(
             self.config.clone(),
             self.local_socket_id,
             self.local_initial_seq,
             conclusion,
             now,
         ) {
-            self.accepted.push_back(conn);
+            Ok(conn) => self.accepted.push_back(conn),
+            Err(error) => self.reject(conclusion, from, reject_reason(&error), now),
         }
+    }
+
+    /// Deferred mode: pre-validates the conclusion's crypto (a mismatch is
+    /// rejected on the spot, exactly like auto-accept, and never surfaced),
+    /// then parks it for the application's decision. A retransmission from an
+    /// already-pending address refreshes the parked conclusion without
+    /// surfacing a duplicate request — the undecided caller retransmits every
+    /// 250 ms while it waits.
+    fn park_conclusion(&mut self, conclusion: &Handshake, from: SocketAddr, now: Instant) {
+        if let Err(error) = Connection::validate_accept(&self.config, conclusion) {
+            self.reject(conclusion, from, reject_reason(&error), now);
+            return;
+        }
+        if let Some(entry) = self.pending.iter_mut().find(|p| p.from == from) {
+            entry.conclusion = conclusion.clone();
+            entry.since = now;
+            return;
+        }
+        self.pending.push(PendingConn {
+            from,
+            conclusion: conclusion.clone(),
+            since: now,
+        });
+        self.requests.push_back(ConnRequest {
+            remote_addr: from,
+            stream_id: conclusion.extensions.iter().find_map(|ext| match ext {
+                HandshakeExtension::StreamId(id) => Some(id.clone()),
+                _ => None,
+            }),
+        });
+    }
+
+    /// Drains the next surfaced [`ConnRequest`], if any (deferred mode).
+    #[must_use]
+    pub fn poll_request(&mut self) -> Option<ConnRequest> {
+        self.requests.pop_front()
+    }
+
+    /// Accepts the pending conclusion from `remote`, returning the established
+    /// listener-side [`Connection`] (its conclusion response is queued in the
+    /// connection's own outputs).
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectionError::InvalidState`] if no conclusion from `remote` is
+    /// pending (never surfaced, already decided, or expired). Other errors
+    /// mirror auto-accept's — the caller is sent a wire rejection and the
+    /// error returned.
+    pub fn accept_pending(
+        &mut self,
+        remote: SocketAddr,
+        now: Instant,
+    ) -> Result<Connection, ConnectionError> {
+        let Some(index) = self.pending.iter().position(|p| p.from == remote) else {
+            return Err(ConnectionError::InvalidState);
+        };
+        let parked = self.pending.swap_remove(index);
+        Connection::accept(
+            self.config.clone(),
+            self.local_socket_id,
+            self.local_initial_seq,
+            &parked.conclusion,
+            now,
+        )
+        .inspect_err(|error| {
+            self.reject(&parked.conclusion, parked.from, reject_reason(error), now);
+        })
+    }
+
+    /// Rejects the pending conclusion from `remote`, answering the caller with
+    /// a `URQ_FAILURE` carrying `reason` (use [`RejectReason::Other`] with a
+    /// code of 2000+ for application-defined reasons, libsrt's user range).
+    /// Returns whether such a conclusion was pending.
+    pub fn reject_pending(
+        &mut self,
+        remote: SocketAddr,
+        reason: RejectReason,
+        now: Instant,
+    ) -> bool {
+        let Some(index) = self.pending.iter().position(|p| p.from == remote) else {
+            return false;
+        };
+        let parked = self.pending.swap_remove(index);
+        self.reject(&parked.conclusion, parked.from, reason, now);
+        true
+    }
+
+    /// Queues a `URQ_FAILURE` handshake answering `conclusion` with `reason`.
+    fn reject(
+        &mut self,
+        conclusion: &Handshake,
+        from: SocketAddr,
+        reason: RejectReason,
+        now: Instant,
+    ) {
+        let response = Handshake {
+            version: HS_VERSION_SRT,
+            encryption: EncryptionField::None,
+            extension_field: 0,
+            initial_seq: self.local_initial_seq,
+            mtu: self.config.mtu,
+            max_flow_window: self.config.flow_window,
+            handshake_type: HandshakeType::rejection(reason),
+            srt_socket_id: self.local_socket_id,
+            syn_cookie: 0,
+            peer_ip: peer_ip(from),
+            extensions: Vec::new(),
+        };
+        let bytes = encode_control(
+            conclusion.srt_socket_id,
+            self.wire_ts(now),
+            ControlBody::Handshake(response),
+        );
+        self.responses.push_back((from, bytes));
     }
 
     /// Drains the next response datagram and the address to send it to, if any.
@@ -169,6 +356,20 @@ impl Listener {
     #[allow(clippy::cast_possible_truncation)] // 32-bit wrapping timestamp by design
     fn wire_ts(&self, now: Instant) -> Timestamp {
         Timestamp::from_micros(now.saturating_duration_since(self.start).as_micros() as u32)
+    }
+}
+
+/// Maps an accept failure to the rejection reason libsrt would send: a missing
+/// or unexpected KMREQ means exactly one side encrypts (`SRT_REJ_UNSECURE`);
+/// any other crypto failure is a key the passphrase cannot unwrap
+/// (`SRT_REJ_BADSECRET`).
+fn reject_reason(error: &ConnectionError) -> RejectReason {
+    match error {
+        ConnectionError::Crypto(
+            CryptoError::MissingKeyMaterial | CryptoError::UnexpectedKeyMaterial,
+        ) => RejectReason::Unsecure,
+        ConnectionError::Crypto(_) => RejectReason::BadSecret,
+        _ => RejectReason::Unknown,
     }
 }
 

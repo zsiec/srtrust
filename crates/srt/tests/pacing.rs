@@ -18,16 +18,7 @@ use bytes::Bytes;
 use srt::{Config, SrtListener, connect};
 
 fn paced_config() -> Config {
-    Config {
-        latency: Duration::from_millis(120),
-        mtu: 1500,
-        flow_window: 25600,
-        stream_id: None,
-        encryption: None,
-        max_bw: 100_000_000, // 800 Mbps
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    Config::default().with_max_bw(100_000_000) // 800 Mbps
 }
 
 /// Flood-submit against an 800 Mbps pace for 3 s and compare the *wire* window
@@ -45,10 +36,10 @@ async fn paced_stream_is_not_stretched_on_the_wire() {
     let mut listener = SrtListener::bind("127.0.0.1:0".parse().unwrap(), paced_config()).unwrap();
     let addr = listener.local_addr();
 
-    let stream = connect("127.0.0.1:0".parse().unwrap(), addr, paced_config())
-        .await
-        .expect("connect");
-    let mut server = listener.accept().await.expect("accept");
+    // Connect and accept concurrently: the handshake completes when the
+    // application accepts the request.
+    let (stream, server) = tokio::join!(connect(addr, paced_config()), listener.accept());
+    let (stream, mut server) = (stream.expect("connect"), server.expect("accept"));
 
     let receiver = tokio::spawn(async move {
         let mut first: Option<Instant> = None;

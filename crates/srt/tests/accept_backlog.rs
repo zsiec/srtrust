@@ -4,8 +4,9 @@
 //! app accepts slowly, or not at all, while handshakes keep arriving), that
 //! await parked the loop that forwards datagrams to **every** established
 //! connection on the socket — and they all died of their peers' idle timeouts.
-//! Overflowing handshakes must be declined instead (the caller times out, as
-//! with a full TCP SYN backlog), keeping live connections flowing.
+//! Overflowing handshakes must be declined instead (the caller is rejected
+//! with `SRT_REJ_BACKLOG`, cf. a full TCP SYN backlog), keeping live
+//! connections flowing.
 
 use std::time::Duration;
 
@@ -13,16 +14,9 @@ use bytes::Bytes;
 use srt::{Config, SrtListener, connect};
 
 fn config() -> Config {
-    Config {
-        latency: Duration::from_millis(50),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    Config::default()
+        .with_latency(Duration::from_millis(50))
+        .with_flow_window(8192)
 }
 
 #[tokio::test]
@@ -30,11 +24,10 @@ async fn a_full_accept_backlog_does_not_freeze_established_connections() {
     let mut listener = SrtListener::bind("127.0.0.1:0".parse().unwrap(), config()).unwrap();
     let addr = listener.local_addr();
 
-    // One real, accepted, working connection.
-    let stream = connect("127.0.0.1:0".parse().unwrap(), addr, config())
-        .await
-        .expect("connect");
-    let mut server = listener.accept().await.expect("accept");
+    // One real, accepted, working connection. Connect and accept concurrently:
+    // the handshake completes when the application accepts the request.
+    let (stream, server) = tokio::join!(connect(addr, config()), listener.accept(),);
+    let (stream, mut server) = (stream.expect("connect"), server.expect("accept"));
     stream
         .send(Bytes::from_static(b"warm"))
         .await
@@ -50,7 +43,7 @@ async fn a_full_accept_backlog_does_not_freeze_established_connections() {
     // to the endpoint, not their own fate.
     for _ in 0..70 {
         tokio::spawn(async move {
-            let _ = connect("127.0.0.1:0".parse().unwrap(), addr, config()).await;
+            let _ = connect(addr, config()).await;
         });
     }
     tokio::time::sleep(Duration::from_millis(1500)).await;

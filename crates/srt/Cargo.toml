@@ -21,13 +21,23 @@ workspace = true
 srt-protocol = { path = "../srt-protocol", version = "0.1.0" }
 bytes = "1"
 tokio = { version = "1", features = ["net", "rt", "time", "sync", "macros"] }
+# `PollSender`, backing the `futures_sink::Sink` impls.
+tokio-util = "0.7"
 quinn-udp = "0.6"
 thiserror = "2"
 getrandom = "0.2"
 socket2 = "0.5"
+# The ecosystem's `Stream`/`Sink` traits (trait-only crates, no machinery).
+futures-core = "0.3"
+futures-sink = "0.3"
+tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+# `StreamExt`/`SinkExt` combinators, used only to exercise the adapter impls.
+futures = "0.3"
+# Captures the crate's tracing events in the `tracing_events` test.
+tracing-subscriber = "0.3"
 # A second async runtime, used only to prove the `Runtime` trait is genuinely
 # swappable (the `second_runtime` integration test drives the whole stack on it).
 smol = "2"

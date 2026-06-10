@@ -57,66 +57,68 @@ bytes = "1"
 **Listener** (receiver):
 
 ```rust,no_run
-use std::time::Duration;
 use srt::{Config, SrtListener};
 
 #[tokio::main]
 async fn main() -> srt::Result<()> {
-    let config = Config {
-        latency: Duration::from_millis(120),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,   // Some(EncryptionSettings { .. }) to encrypt
-        max_bw: 0,          // 0 = unpaced
-        km_refresh_rate: 0, // 0 = default
-        fec: None,
-    };
+    // Config::default() is deployment-ready (120 ms latency, 1500 MTU,
+    // unpaced); refine it with the with_* builders, e.g.
+    // .with_passphrase("...") to encrypt or .with_latency(...) to retune.
+    let config = Config::default();
     let mut listener = SrtListener::bind("0.0.0.0:9000".parse().unwrap(), config)?;
-    let mut stream = listener.accept().await?;
-    while let Some(payload) = stream.recv().await {
-        println!("got {} bytes", payload.len());
+    loop {
+        let mut stream = listener.accept().await?;
+        tokio::spawn(async move {
+            while let Some(payload) = stream.recv().await {
+                println!("{} bytes from {}", payload.len(), stream.peer_addr());
+            }
+        });
     }
-    Ok(())
 }
 ```
 
 **Caller** (sender):
 
 ```rust,no_run
-use std::time::Duration;
 use bytes::Bytes;
 use srt::{connect, Config};
 
 #[tokio::main]
 async fn main() -> srt::Result<()> {
-    let config = Config {
-        latency: Duration::from_millis(120),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    };
-    let stream = connect(
-        "0.0.0.0:0".parse().unwrap(),       // local bind (ephemeral port)
-        "127.0.0.1:9000".parse().unwrap(),  // remote listener
-        config,
-    )
-    .await?;
+    let config = Config::default();
+    // Anything address-like works; the local end binds an ephemeral port
+    // (use `connect_from` to control the local binding).
+    let stream = connect("127.0.0.1:9000", config).await?;
     stream.send(Bytes::from_static(b"hello, srt")).await?;
     stream.close().await?;
     Ok(())
 }
 ```
 
-A runnable end-to-end demo lives in [`crates/srt/examples/echo.rs`](./crates/srt/examples/echo.rs):
+Good to know, up front:
 
-```console
-cargo run --example echo
-```
+- **A caller's handshake completes when the listener app accepts it** — keep an
+  `accept()`/`incoming()` loop running while callers connect (every server
+  looks like the loop above).
+- **Vetting callers:** `listener.incoming()` yields a `ConnRequest` exposing
+  the caller's Stream ID and address, with `accept().await` /
+  `reject(reason)` — the rejection reaches the caller as a real SRT rejection
+  code instead of a timeout.
+- **Invalid config fails fast:** a 5-character passphrase or 20-byte MTU is
+  rejected at `connect`/`bind` with a `ConfigError` saying why.
+
+The [`srt` crate README](./crates/srt/README.md) has copy-paste recipes for
+encryption, caller vetting, task-splitting (`into_split`), `futures`
+Stream/Sink adapters, stats, and `tracing`.
+
+### Runnable examples
+
+| Example | What it shows |
+|---|---|
+| `cargo run --example echo` | Minimal end-to-end send/receive in one process |
+| `cargo run --example restream` | A live ingest-and-fan-out relay (listener → many clients) |
+| `cargo run --example srt_bench -- loopback` | Throughput measurement (also sender/receiver modes) |
+| `cargo run --example interop_listener -- 9000` | Interop endpoint for testing against libsrt tools |
 
 ## Feature scope
 
@@ -131,7 +133,7 @@ cargo run --example echo
 - Message-mode framing (fragmentation + reassembly)
 - Row FEC (forward error correction) on the wire
 - Keepalive + idle/dead-peer timeout, reorder tolerance
-- Statistics API
+- Statistics API (RTT, rates, buffer levels, ACK/NAK counters) + `tracing` instrumentation
 
 **Deferred (the core is designed to add these without rework):** rendezvous mode,
 File/Buffer congestion control, column/staircase FEC layouts + FEC handshake

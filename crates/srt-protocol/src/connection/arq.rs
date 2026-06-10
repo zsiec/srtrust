@@ -83,7 +83,7 @@ impl Connection {
         });
         self.outputs.push_back(Output::SetTimer {
             id: TimerId::PeerIdle,
-            after: super::PEER_IDLE_TIMEOUT,
+            after: self.config.peer_idle_timeout,
         });
         self.last_sent = now;
         self.last_recv_any = now; // the conclusion that established us counts
@@ -128,7 +128,7 @@ impl Connection {
             return;
         }
         let idle = now.saturating_duration_since(self.last_recv_any);
-        if idle >= super::PEER_IDLE_TIMEOUT {
+        if idle >= self.config.peer_idle_timeout {
             self.state = State::Failed;
             self.clear_arq_timers();
             self.events
@@ -137,7 +137,7 @@ impl Connection {
         }
         self.outputs.push_back(Output::SetTimer {
             id: TimerId::PeerIdle,
-            after: super::PEER_IDLE_TIMEOUT.saturating_sub(idle),
+            after: self.config.peer_idle_timeout.saturating_sub(idle),
         });
     }
 
@@ -298,6 +298,7 @@ impl Connection {
     /// the EXP backstop, and (for a full ACK) reply with an ACKACK so the peer can
     /// measure RTT.
     pub(super) fn on_ack(&mut self, ack: Ack, now: Instant) {
+        self.stats.acks_received += 1;
         self.send_buffer.ack(ack.last_ack_seq);
         // A full ACK reports how much receive buffer the peer has free (spec
         // §3.2.4); that bounds our send window (spec §4.8) — see
@@ -340,6 +341,7 @@ impl Connection {
     /// still hold — after first dropping any that are now too late to play
     /// (so we DROPREQ them instead of wastefully retransmitting).
     pub(super) fn on_nak(&mut self, loss: &[LossRange], now: Instant) {
+        self.stats.naks_received += 1;
         self.drop_too_late(now);
         for range in loss {
             self.retransmit_range(range.start(), range.end(), now);
@@ -749,6 +751,7 @@ impl Connection {
                 receiving_rate,
             },
         };
+        self.stats.acks_sent += 1;
         let bytes = encode_control(
             self.peer_socket_id,
             self.wire_ts(now),
@@ -803,6 +806,7 @@ impl Connection {
             last_ack_seq: self.recv_buffer.received_ack_point(),
             cif: AckCif::Light,
         };
+        self.stats.acks_sent += 1;
         let bytes = encode_control(
             self.peer_socket_id,
             self.wire_ts(now),
@@ -824,6 +828,7 @@ impl Connection {
             self.wire_ts(now),
             ControlBody::Nak { loss },
         );
+        self.stats.naks_sent += 1;
         self.emit(bytes, now);
         self.last_nak = Some(now);
     }

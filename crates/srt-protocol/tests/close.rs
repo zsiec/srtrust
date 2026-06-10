@@ -15,20 +15,13 @@ use srt_protocol::packet::SocketId;
 use srt_protocol::seq::SeqNumber;
 
 fn config() -> Config {
-    Config {
-        // A long TSBPD latency means freshly-received data sits in the receive
-        // buffer (not yet played) for a while — so an abrupt SHUTDOWN that did
-        // not flush it would visibly drop the tail. That is exactly what the
-        // graceful path must prevent.
-        latency: Duration::from_secs(1),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    // A long TSBPD latency means freshly-received data sits in the receive
+    // buffer (not yet played) for a while — so an abrupt SHUTDOWN that did
+    // not flush it would visibly drop the tail. That is exactly what the
+    // graceful path must prevent.
+    Config::default()
+        .with_latency(Duration::from_secs(1))
+        .with_flow_window(8192)
 }
 
 fn caller(now: std::time::Instant) -> Connection {

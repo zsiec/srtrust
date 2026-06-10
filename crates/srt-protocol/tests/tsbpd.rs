@@ -12,16 +12,9 @@ use srt_protocol::packet::SocketId;
 use srt_protocol::seq::SeqNumber;
 
 fn config(latency_ms: u64) -> Config {
-    Config {
-        latency: Duration::from_millis(latency_ms),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    Config::default()
+        .with_latency(Duration::from_millis(latency_ms))
+        .with_flow_window(8192)
 }
 
 fn connected(c2l: LinkConfig, l2c: LinkConfig, seed: u64, latency_ms: u64) -> Pair {

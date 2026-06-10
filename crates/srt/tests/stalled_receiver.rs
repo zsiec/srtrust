@@ -12,16 +12,9 @@ use bytes::Bytes;
 use srt::{Config, SrtListener, connect};
 
 fn config() -> Config {
-    Config {
-        latency: Duration::from_millis(50),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    Config::default()
+        .with_latency(Duration::from_millis(50))
+        .with_flow_window(8192)
 }
 
 /// Flood more messages than the driver→app channel holds (256), stall the app
@@ -33,10 +26,10 @@ async fn a_stalled_app_reader_does_not_kill_the_connection() {
     let mut listener = SrtListener::bind("127.0.0.1:0".parse().unwrap(), config()).unwrap();
     let addr = listener.local_addr();
 
-    let stream = connect("127.0.0.1:0".parse().unwrap(), addr, config())
-        .await
-        .expect("connect");
-    let mut server = listener.accept().await.expect("accept");
+    // Connect and accept concurrently: the handshake completes when the
+    // application accepts the request.
+    let (stream, server) = tokio::join!(connect(addr, config()), listener.accept(),);
+    let (stream, mut server) = (stream.expect("connect"), server.expect("accept"));
 
     // Well past the data-channel capacity, well within the flow window.
     let n: u32 = 600;

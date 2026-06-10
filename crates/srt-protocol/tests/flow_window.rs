@@ -14,16 +14,10 @@ use srt_protocol::packet::SocketId;
 use srt_protocol::seq::SeqNumber;
 
 fn config(flow_window: u32, latency_ms: u64) -> Config {
-    Config {
-        latency: Duration::from_millis(latency_ms),
-        mtu: 1500,
-        flow_window,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0, // the default, unpaced path
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    // max_bw stays at the default 0: the unpaced path.
+    Config::default()
+        .with_latency(Duration::from_millis(latency_ms))
+        .with_flow_window(flow_window)
 }
 
 fn connected(flow_window: u32, latency_ms: u64) -> Pair {

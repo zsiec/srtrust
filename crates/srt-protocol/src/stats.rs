@@ -48,4 +48,18 @@ pub struct Stats {
     pub recv_rate_bps: u32,
     /// Estimated link capacity (peak observed rate), packets/second.
     pub link_capacity_pps: u32,
+    /// ACK control packets sent (full and light; libsrt's `pktSentACKTotal`).
+    pub acks_sent: u64,
+    /// ACK control packets received (libsrt's `pktRecvACKTotal`).
+    pub acks_received: u64,
+    /// NAK loss reports sent (libsrt's `pktSentNAKTotal`).
+    pub naks_sent: u64,
+    /// NAK loss reports received (libsrt's `pktRecvNAKTotal`).
+    pub naks_received: u64,
+    /// Data packets held by the sender: unacknowledged in-flight plus queued
+    /// behind the pacer (libsrt's `pktSndBuf`). The send backlog.
+    pub send_buffer_packets: u32,
+    /// The **negotiated** TSBPD latency, milliseconds — the larger of the two
+    /// advertised values (spec §4.3.1.2), not necessarily what was configured.
+    pub latency_ms: u32,
 }

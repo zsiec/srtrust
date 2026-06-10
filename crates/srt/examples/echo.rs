@@ -19,16 +19,9 @@ use srt::{Config, SrtListener, connect};
 /// A typical live-mode configuration: 120 ms latency budget, 1500-byte MTU, no
 /// encryption, no pacing. Both ends of a connection use the same shape.
 fn live_config() -> Config {
-    Config {
-        latency: Duration::from_millis(120),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    Config::default()
+        .with_latency(Duration::from_millis(120))
+        .with_flow_window(8192)
 }
 
 #[tokio::main]
@@ -55,7 +48,7 @@ async fn main() -> srt::Result<()> {
 
     // The sender: connect, send a few messages, then close gracefully (which
     // lingers until the data has been acknowledged before tearing the socket down).
-    let caller = connect("127.0.0.1:0".parse().unwrap(), addr, live_config()).await?;
+    let caller = connect(addr, live_config()).await?;
     println!("caller: connected, sending");
     for i in 0..5 {
         caller.send(Bytes::from(format!("message {i}"))).await?;

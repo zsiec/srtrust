@@ -68,6 +68,7 @@ impl Inbound {
 }
 
 /// Application → driver commands.
+#[derive(Debug)]
 pub(crate) enum Command {
     /// Send application data reliably.
     Send(Bytes),
@@ -191,7 +192,9 @@ pub(crate) async fn drive_connection<R: Runtime>(
                     Ok(permit) => {
                         permit.send(pending_data.take().expect("guarded by is_some"));
                     }
-                    Err(_) => break, // the application dropped its receiver
+                    // The app dropped its receive half mid-backlog: discard
+                    // the parked payload and keep the connection running.
+                    Err(_) => pending_data = None,
                 }
             }
             // Backpressure: only pull application commands while the send window
@@ -225,16 +228,39 @@ pub(crate) async fn drive_connection<R: Runtime>(
             }
         }
     }
+    tracing::debug!(%peer, "connection driver stopped");
 }
 
 /// The application channel ends a freshly-accepted connection is reached through.
 pub(crate) type Accepted = (mpsc::Sender<Command>, mpsc::Receiver<Bytes>);
+
+/// A [`crate::ConnRequest`] decision travelling back to the endpoint driver.
+pub(crate) enum Decision {
+    /// Accept the pending conclusion from `addr`; reply with the new stream's
+    /// channel ends (or the error that prevented the accept).
+    Accept {
+        addr: SocketAddr,
+        reply: oneshot::Sender<Result<Accepted, Error>>,
+    },
+    /// Reject the pending conclusion from `addr` with `reason` (sent to the
+    /// caller as a `URQ_FAILURE` handshake).
+    Reject {
+        addr: SocketAddr,
+        reason: srt_protocol::handshake::RejectReason,
+    },
+}
 
 /// Drives a listening endpoint: owns the one shared socket, answers handshakes,
 /// and **demuxes** every inbound datagram to the right connection by its peer
 /// address. Each accepted connection runs in its own [`drive_connection`] task
 /// and shares the socket for sending; the endpoint forwards its datagrams over a
 /// channel. This is what lets one listener serve many concurrent callers.
+///
+/// The core listener runs in deferred-accept mode: each crypto-valid conclusion
+/// surfaces as a [`crate::ConnRequest`] on `requests_tx`, and the application's
+/// accept/reject comes back as a [`Decision`] — `SrtListener::accept()` is just
+/// `incoming().accept()`, so auto-accept costs one round trip through the same
+/// channels.
 ///
 /// Demux key is the peer [`SocketAddr`]: distinct callers bind distinct source
 /// ports, so the (ip, port) tuple uniquely identifies a connection. (libsrt also
@@ -245,13 +271,18 @@ pub(crate) async fn drive_endpoint<R: Runtime>(
     runtime: Arc<R>,
     socket: Arc<dyn AsyncUdpSocket>,
     mut listener: Listener,
-    accept_tx: mpsc::Sender<Accepted>,
+    local_addr: SocketAddr,
+    requests_tx: mpsc::Sender<crate::ConnRequest>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut recv_buf = vec![0u8; RECV_BUF];
     // Established connections, keyed by peer address; the value forwards inbound
     // datagrams (paired with their arrival time) to that connection's driver task.
     let mut connections: HashMap<SocketAddr, mpsc::Sender<(Instant, Bytes)>> = HashMap::new();
+    // Decisions flow back from `ConnRequest` handles. The sender side is cloned
+    // into every surfaced request; this receiver never closes because we hold a
+    // sender too.
+    let (decisions_tx, mut decisions_rx) = mpsc::channel::<Decision>(COMMAND_CAPACITY);
 
     loop {
         // An idle endpoint parks on the socket indefinitely, so the listener
@@ -260,6 +291,16 @@ pub(crate) async fn drive_endpoint<R: Runtime>(
         // (BUG-05b, docs/known-issues/05 — task + socket leak on drop).
         let received = tokio::select! {
             received = poll_fn(|cx| socket.poll_recv_gro(cx, &mut recv_buf)) => received,
+            decision = decisions_rx.recv() => {
+                let Some(decision) = decision else { continue };
+                if apply_decision(&runtime, &socket, &mut listener, &mut connections, decision)
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                continue;
+            }
             _ = &mut shutdown => return, // the application dropped the listener
         };
         let Ok((len, stride, from)) = received else {
@@ -294,50 +335,116 @@ pub(crate) async fn drive_endpoint<R: Runtime>(
         for segment in gro_split(&recv_buf, len, stride) {
             listener.feed_recv_buf(segment, from, now);
         }
-        while let Some((addr, datagram)) = listener.poll_response() {
-            if poll_fn(|cx| socket.poll_send(cx, &datagram, addr))
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
-        while let Some(conn) = listener.poll_accept() {
-            let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
-            let (data_tx, data_rx) = mpsc::channel(DATA_CAPACITY);
-            let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CAPACITY);
-            // Hand the new connection to the application *without waiting*: an
-            // `.await` here would park this demux loop — the only thing
-            // forwarding datagrams to every established connection on the
-            // socket — whenever the app fell behind on `accept()` (BUG-05g,
-            // docs/known-issues/05). A full backlog declines the connection
-            // instead: the caller times out and may retry, exactly like a full
-            // TCP SYN backlog.
-            match accept_tx.try_send((commands_tx, data_rx)) {
-                Ok(()) => {
-                    connections.insert(from, inbound_tx);
-                    let channels = StreamChannels {
-                        commands: commands_rx,
-                        data: data_tx,
-                        connected: None, // the acceptor is already connected
-                    };
-                    runtime.spawn(Box::pin(drive_connection(
-                        runtime.clone(),
-                        socket.clone(),
-                        conn,
-                        from,
-                        channels,
-                        Inbound::Demuxed(inbound_rx),
-                    )));
+        // Surface each new conclusion to the application *without waiting*: an
+        // `.await` here would park this demux loop — the only thing forwarding
+        // datagrams to every established connection on the socket — whenever
+        // the app fell behind (BUG-05g, docs/known-issues/05). A full backlog
+        // rejects the caller outright (`SRT_REJ_BACKLOG`), like a full TCP SYN
+        // backlog but with an answer instead of silence.
+        while let Some(request) = listener.poll_request() {
+            let addr = request.remote_addr();
+            tracing::debug!(
+                remote = %addr,
+                stream_id = ?request.stream_id(),
+                "connection request"
+            );
+            let request = crate::ConnRequest {
+                stream_id: request.stream_id().map(str::to_owned),
+                remote_addr: addr,
+                local_addr,
+                decisions: decisions_tx.clone(),
+            };
+            match requests_tx.try_send(request) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    tracing::warn!(remote = %addr, "request backlog full; rejecting");
+                    listener.reject_pending(
+                        addr,
+                        srt_protocol::handshake::RejectReason::Backlog,
+                        now,
+                    );
                 }
-                // Backlog full: drop `conn` undriven (never inserted, never
-                // spawned); the peer gets no ACKs and gives up on its own.
-                Err(TrySendError::Full(_)) => {}
                 // The application dropped the listener handle.
                 Err(TrySendError::Closed(_)) => return,
             }
         }
+        if flush_listener_responses(&socket, &mut listener)
+            .await
+            .is_err()
+        {
+            return;
+        }
     }
+}
+
+/// Applies one application accept/reject [`Decision`] to the core listener:
+/// an accept spawns the connection's driver and replies with its channel ends;
+/// a reject (or a failed accept) sends the queued `URQ_FAILURE` to the caller.
+/// `Err` means the socket died and the endpoint should shut down.
+async fn apply_decision<R: Runtime>(
+    runtime: &Arc<R>,
+    socket: &Arc<dyn AsyncUdpSocket>,
+    listener: &mut Listener,
+    connections: &mut HashMap<SocketAddr, mpsc::Sender<(Instant, Bytes)>>,
+    decision: Decision,
+) -> Result<(), ()> {
+    let now = runtime.now();
+    match decision {
+        Decision::Accept { addr, reply } => match listener.accept_pending(addr, now) {
+            Ok(conn) => {
+                tracing::info!(remote = %addr, "accepted");
+                // Evict demux entries whose connection driver has since ended
+                // (their channel receiver is gone). Without this sweep a
+                // long-running listener accumulates one dead entry per closed
+                // peer that never sends another datagram.
+                connections.retain(|_, tx| !tx.is_closed());
+                let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
+                let (data_tx, data_rx) = mpsc::channel(DATA_CAPACITY);
+                let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CAPACITY);
+                connections.insert(addr, inbound_tx);
+                let channels = StreamChannels {
+                    commands: commands_rx,
+                    data: data_tx,
+                    connected: None, // the acceptor is already connected
+                };
+                runtime.spawn(Box::pin(drive_connection(
+                    runtime.clone(),
+                    socket.clone(),
+                    conn,
+                    addr,
+                    channels,
+                    Inbound::Demuxed(inbound_rx),
+                )));
+                let _ = reply.send(Ok((commands_tx, data_rx)));
+            }
+            Err(error) => {
+                tracing::warn!(remote = %addr, %error, "accept failed");
+                let _ = reply.send(Err(Error::Protocol(error)));
+            }
+        },
+        Decision::Reject { addr, reason } => {
+            tracing::info!(remote = %addr, %reason, "rejected");
+            listener.reject_pending(addr, reason, now);
+        }
+    }
+    flush_listener_responses(socket, listener).await
+}
+
+/// Sends every response datagram the core listener has queued (induction
+/// answers and rejections). `Err` means the socket died.
+async fn flush_listener_responses(
+    socket: &Arc<dyn AsyncUdpSocket>,
+    listener: &mut Listener,
+) -> Result<(), ()> {
+    while let Some((addr, datagram)) = listener.poll_response() {
+        if poll_fn(|cx| socket.poll_send(cx, &datagram, addr))
+            .await
+            .is_err()
+        {
+            return Err(());
+        }
+    }
+    Ok(())
 }
 
 /// Drains the connection's outputs: collects datagrams to send to `peer` (sent in
@@ -413,8 +520,13 @@ async fn flush_sends(
 /// the core, where they shrink the receive-buffer availability the next ACK
 /// advertises — closing the peer's send window instead of growing memory.
 ///
+/// A *closed* data channel (the app dropped its `SrtStream`/`SrtRecvHalf`) is
+/// not a stop condition: inbound payloads are discarded and the connection
+/// keeps running, exactly like an unread TCP stream — teardown is the command
+/// channel's job (dropping the send side closes the connection).
+///
 /// Returns `true` when the driver should stop (the connection closed or
-/// failed, or the app hung up).
+/// failed).
 fn drain_events(
     conn: &mut Connection,
     channels: &mut StreamChannels,
@@ -425,12 +537,14 @@ fn drain_events(
     // delivery order.
     if let Some(payload) = pending_data.take() {
         match channels.data.try_send(payload) {
-            Ok(()) => {}
+            // Delivered — or the app dropped its receive half, which only
+            // means it stopped reading (payloads are discarded, the
+            // connection lives on; cf. dropping a TCP read half).
+            Ok(()) | Err(TrySendError::Closed(_)) => {}
             Err(TrySendError::Full(payload)) => {
                 *pending_data = Some(payload);
                 return false; // app still slow: leave events in the core
             }
-            Err(TrySendError::Closed(_)) => return true,
         }
     }
     while let Some(event) = conn.poll_event() {
@@ -448,12 +562,13 @@ fn drain_events(
                 conn.provide_rekey(&sek, now);
             }
             Event::DataReceived(payload) => match channels.data.try_send(payload) {
-                Ok(()) => {}
+                // Delivered, or discarded because the app dropped its receive
+                // half (see above) — either way, keep going.
+                Ok(()) | Err(TrySendError::Closed(_)) => {}
                 Err(TrySendError::Full(payload)) => {
                     *pending_data = Some(payload);
                     return false; // pause event polling until capacity frees
                 }
-                Err(TrySendError::Closed(_)) => return true,
             },
             Event::Failed(reason) => {
                 if let Some(tx) = channels.connected.take() {

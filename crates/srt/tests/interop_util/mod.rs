@@ -73,16 +73,9 @@ macro_rules! require_libsrt {
 pub(crate) use require_libsrt;
 
 pub fn base_config() -> Config {
-    Config {
-        latency: Duration::from_millis(120),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    Config::default()
+        .with_latency(Duration::from_millis(120))
+        .with_flow_window(8192)
 }
 
 pub fn encrypted(cipher: CipherMode, km_refresh_rate: u32) -> Config {
@@ -90,15 +83,13 @@ pub fn encrypted(cipher: CipherMode, km_refresh_rate: u32) -> Config {
 }
 
 pub fn encrypted_sized(cipher: CipherMode, km_refresh_rate: u32, key_size: KeySize) -> Config {
-    Config {
-        encryption: Some(EncryptionSettings {
+    base_config()
+        .with_encryption(EncryptionSettings {
             passphrase: PASSPHRASE.as_bytes().to_vec(),
             key_size,
             cipher,
-        }),
-        km_refresh_rate,
-        ..base_config()
-    }
+        })
+        .with_km_refresh_rate(km_refresh_rate)
 }
 
 /// A spawned helper process that is killed when dropped, so a panicking test
@@ -393,13 +384,9 @@ pub async fn srtrust_sender_run(
     len: usize,
     settle: Duration,
 ) -> Vec<u32> {
-    let stream = connect(
-        "127.0.0.1:0".parse().unwrap(),
-        format!("127.0.0.1:{target_port}").parse().unwrap(),
-        config,
-    )
-    .await
-    .expect("srtrust caller connects to libsrt");
+    let stream = connect(format!("127.0.0.1:{target_port}"), config)
+        .await
+        .expect("srtrust caller connects to libsrt");
 
     for i in 0..messages {
         stream

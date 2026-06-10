@@ -27,16 +27,9 @@ const COOKIE_SECRET: u64 = 0xC0FF_EE00_1234_5678;
 const LATENCY_MS: u64 = 120;
 
 fn live_config() -> Config {
-    Config {
-        latency: Duration::from_millis(LATENCY_MS),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    Config::default()
+        .with_latency(Duration::from_millis(LATENCY_MS))
+        .with_flow_window(8192)
 }
 
 fn caller(now: std::time::Instant) -> Connection {

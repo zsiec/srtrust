@@ -165,20 +165,23 @@ pub(super) fn accept_crypto(
     encryption: Option<&EncryptionSettings>,
     caller_hs: &Handshake,
 ) -> Result<(Option<UnwrappedKm>, Option<Bytes>), ConnectionError> {
+    let kmreq = caller_hs.extensions.iter().find_map(|ext| match ext {
+        HandshakeExtension::Raw {
+            ext_type: EXT_KMREQ,
+            content,
+        } => Some(content),
+        _ => None,
+    });
     let Some(enc) = encryption else {
+        // An encrypted caller against a plaintext listener: exactly one side
+        // wants the connection secured, so decline it (libsrt's enforced
+        // encryption, `SRT_REJ_UNSECURE`) rather than accept undecryptable data.
+        if kmreq.is_some() {
+            return Err(ConnectionError::Crypto(CryptoError::UnexpectedKeyMaterial));
+        }
         return Ok((None, None));
     };
-    let km_bytes = caller_hs
-        .extensions
-        .iter()
-        .find_map(|ext| match ext {
-            HandshakeExtension::Raw {
-                ext_type: EXT_KMREQ,
-                content,
-            } => Some(content),
-            _ => None,
-        })
-        .ok_or(ConnectionError::Crypto(CryptoError::MissingKeyMaterial))?;
+    let km_bytes = kmreq.ok_or(ConnectionError::Crypto(CryptoError::MissingKeyMaterial))?;
     let km = KeyMaterial::decode(km_bytes).map_err(ConnectionError::Crypto)?;
     let keys =
         SessionKeys::from_key_material(&km, &enc.passphrase).map_err(ConnectionError::Crypto)?;

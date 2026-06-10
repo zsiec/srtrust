@@ -9,16 +9,9 @@ use std::time::Duration;
 use srt::{Config, SrtListener};
 
 fn config() -> Config {
-    Config {
-        latency: Duration::from_millis(50),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    Config::default()
+        .with_latency(Duration::from_millis(50))
+        .with_flow_window(8192)
 }
 
 #[tokio::test]

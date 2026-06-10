@@ -11,27 +11,16 @@ use bytes::Bytes;
 use srt::{Config, SrtListener, connect};
 
 fn paced_config() -> Config {
-    Config {
-        // A deliberately slow pace (~2 Mbps) so the queue cannot drain quickly —
-        // the app will outrun it and must be held back.
-        max_bw: 250_000,
-        ..unpaced_config()
-    }
+    // A deliberately slow pace (~2 Mbps) so the queue cannot drain quickly —
+    // the app will outrun it and must be held back.
+    unpaced_config().with_max_bw(250_000)
 }
 
 fn unpaced_config() -> Config {
-    Config {
-        latency: Duration::from_millis(120),
-        mtu: 1500,
-        // A tiny flow window: at most this many packets may be unacknowledged or
-        // queued before the sender must wait.
-        flow_window: 16,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0, // the default: no pacing
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    // The smallest flow window validation allows: at most this many packets may
+    // be unacknowledged or queued before the sender must wait. max_bw stays 0:
+    // no pacing.
+    Config::default().with_flow_window(32)
 }
 
 /// BUG-04 (docs/known-issues/04): the **default** config (`max_bw = 0`) bypasses
@@ -46,11 +35,10 @@ async fn unpaced_default_config_backpressures_on_a_stalled_receiver() {
     let mut listener = SrtListener::bind("127.0.0.1:0".parse().unwrap(), unpaced_config()).unwrap();
     let addr = listener.local_addr();
 
-    let stream = connect("127.0.0.1:0".parse().unwrap(), addr, unpaced_config())
-        .await
-        .expect("connect");
-    // Accept, then never read: the receiver stalls completely.
-    let _server = listener.accept().await.expect("accept");
+    // Connect and accept concurrently (the handshake completes when the
+    // application accepts), then never read: the receiver stalls completely.
+    let (stream, server) = tokio::join!(connect(addr, unpaced_config()), listener.accept(),);
+    let (stream, _server) = (stream.expect("connect"), server.expect("accept"));
 
     let completed = Arc::new(AtomicU64::new(0));
     let flooder_completed = completed.clone();
@@ -89,9 +77,7 @@ async fn send_blocks_when_the_window_is_full() {
         while server.recv().await.is_some() {}
     });
 
-    let stream = connect("127.0.0.1:0".parse().unwrap(), addr, paced_config())
-        .await
-        .expect("connect");
+    let stream = connect(addr, paced_config()).await.expect("connect");
 
     // A task that submits as fast as it is allowed to, counting completed sends.
     let completed = Arc::new(AtomicU64::new(0));

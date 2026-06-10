@@ -45,16 +45,9 @@ fn live_config() -> Config {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(120);
-    Config {
-        latency: Duration::from_millis(latency_ms),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    Config::default()
+        .with_latency(Duration::from_millis(latency_ms))
+        .with_flow_window(8192)
 }
 
 #[tokio::main]

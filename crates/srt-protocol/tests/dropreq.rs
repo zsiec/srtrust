@@ -16,16 +16,9 @@ use srt_protocol::seq::SeqNumber;
 /// A short latency so the play-out budget is tight: packets that loss keeps from
 /// arriving quickly become too late, triggering send-side TLPKTDROP + DROPREQ.
 fn config() -> Config {
-    Config {
-        latency: Duration::from_millis(80),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: None,
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+    Config::default()
+        .with_latency(Duration::from_millis(80))
+        .with_flow_window(8192)
 }
 
 fn connected(c2l: LinkConfig, l2c: LinkConfig, seed: u64) -> Pair {

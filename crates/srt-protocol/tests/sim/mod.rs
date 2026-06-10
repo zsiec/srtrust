@@ -603,6 +603,45 @@ impl Pair {
         self.now_us
     }
 
+    // ---- deferred accept (the listener's connection-request API) ----
+
+    /// The simulated caller's address, as the listener sees it.
+    #[must_use]
+    pub fn caller_addr() -> SocketAddr {
+        CALLER_ADDR
+    }
+
+    /// Drains the listener's next surfaced connection request, if any.
+    pub fn listener_poll_request(&mut self) -> Option<srt_protocol::listener::ConnRequest> {
+        self.listener.poll_request()
+    }
+
+    /// Accepts the pending conclusion from `remote`, installing the resulting
+    /// connection as the accepted side.
+    pub fn listener_accept_pending(
+        &mut self,
+        remote: SocketAddr,
+    ) -> Result<(), srt_protocol::error::ConnectionError> {
+        let now = self.now();
+        let conn = self.listener.accept_pending(remote, now)?;
+        self.accepted = Some(conn);
+        self.pump();
+        Ok(())
+    }
+
+    /// Rejects the pending conclusion from `remote` with `reason`, returning
+    /// whether such a conclusion was pending.
+    pub fn listener_reject_pending(
+        &mut self,
+        remote: SocketAddr,
+        reason: srt_protocol::handshake::RejectReason,
+    ) -> bool {
+        let now = self.now();
+        let rejected = self.listener.reject_pending(remote, reason, now);
+        self.pump();
+        rejected
+    }
+
     /// Advances the fake clock by at least `micros`, processing every event along
     /// the way (jumping straight to the target if the network is quiescent).
     pub fn run_for(&mut self, micros: u64) {

@@ -17,20 +17,14 @@ fn config(passphrase: &[u8], key_size: KeySize) -> Config {
 }
 
 fn cipher_config(passphrase: &[u8], key_size: KeySize, cipher: CipherMode) -> Config {
-    Config {
-        latency: Duration::from_millis(200),
-        mtu: 1500,
-        flow_window: 8192,
-        stream_id: None,
-        encryption: Some(EncryptionSettings {
+    Config::default()
+        .with_latency(Duration::from_millis(200))
+        .with_flow_window(8192)
+        .with_encryption(EncryptionSettings {
             passphrase: passphrase.to_vec(),
             key_size,
             cipher,
-        }),
-        max_bw: 0,
-        km_refresh_rate: 0,
-        fec: None,
-    }
+        })
 }
 
 /// A deterministic fill for the embedder's RNG (test-only): the exact key bytes
@@ -134,14 +128,9 @@ fn gcm_recovers_lost_packets_via_retransmit() {
     // A wide latency budget so NAK/EXP recovery completes before TLPKTDROP would
     // shed a too-late packet (reorder tolerance delays NAKs, so the budget must be
     // generous — live SRT runs with latency well above the recovery time).
-    let cfg = Config {
-        latency: Duration::from_secs(10),
-        ..cipher_config(b"swordfish", KeySize::Aes128, CipherMode::Gcm)
-    };
-    let listener_cfg = Config {
-        latency: Duration::from_secs(10),
-        ..config(b"swordfish", KeySize::Aes128)
-    };
+    let cfg = cipher_config(b"swordfish", KeySize::Aes128, CipherMode::Gcm)
+        .with_latency(Duration::from_secs(10));
+    let listener_cfg = config(b"swordfish", KeySize::Aes128).with_latency(Duration::from_secs(10));
     let caller = Connection::connect(
         cfg,
         SocketId::new(0x11),
