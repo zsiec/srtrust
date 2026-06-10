@@ -18,22 +18,40 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use srt::{Config, SrtListener, connect};
+use srt::{CipherMode, Config, EncryptionSettings, KeySize, SrtListener, connect};
 
 fn config() -> Config {
-    // SRT_MAXBW (bytes/sec) paces the sender; 0 = unlimited (floods, no flow
-    // control — useful to find the raw send ceiling, but the receiver can be
-    // overwhelmed).
+    // SRT_MAXBW (bytes/sec) paces the sender; 0 = unlimited (floods; the
+    // receiver's advertised window is then the only brake).
     let max_bw = std::env::var("SRT_MAXBW")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    // SRT_FC: flow window in packets (cf. libsrt SRTO_FC; srtgo's bench uses
+    // 25600). The receiver's advertised window caps steady-state throughput at
+    // roughly flow_window/latency packets per second.
+    let flow_window = std::env::var("SRT_FC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192);
+    // SRT_PASSPHRASE enables AES-128; SRT_GCM=1 selects GCM over CTR.
+    let encryption = std::env::var("SRT_PASSPHRASE")
+        .ok()
+        .map(|passphrase| EncryptionSettings {
+            passphrase: passphrase.into_bytes(),
+            key_size: KeySize::Aes128,
+            cipher: if std::env::var("SRT_GCM").is_ok_and(|v| v == "1") {
+                CipherMode::Gcm
+            } else {
+                CipherMode::Ctr
+            },
+        });
     Config {
         latency: Duration::from_millis(120),
         mtu: 1500,
-        flow_window: 8192,
+        flow_window,
         stream_id: None,
-        encryption: None,
+        encryption,
         max_bw,
         km_refresh_rate: 0,
         fec: None,
@@ -132,8 +150,14 @@ async fn sender(addr: std::net::SocketAddr, secs: u64, payload: usize) {
         }
         sent += payload as u64;
     }
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    report("srtrust sender", sent, start.elapsed(), payload);
+    let elapsed = start.elapsed();
+    // Close gracefully and WAIT: a paced close lingers while the queue drains,
+    // and exiting the process first kills the driver before its SHUTDOWN goes
+    // out — the receiver then burns its 5 s peer-idle timeout, inflating its
+    // measurement window by that tail.
+    let _ = stream.close().await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    report("srtrust sender", sent, elapsed, payload);
 }
 
 async fn receiver(port: u16, secs: u64) {
@@ -143,12 +167,19 @@ async fn receiver(port: u16, secs: u64) {
     let mut stream = listener.accept().await.expect("accept");
     let mut bytes = 0u64;
     let mut payload = 1316usize;
+    // Measure over the first→last DATA window: a peer that dies without a
+    // clean shutdown costs a 5 s peer-idle wait that must not dilute the rate.
     let start = Instant::now();
+    let mut first: Option<Instant> = None;
+    let mut last = start;
     while let Ok(Some(data)) =
         tokio::time::timeout(Duration::from_secs(secs + 2), stream.recv()).await
     {
+        last = Instant::now();
+        first.get_or_insert(last);
         payload = data.len();
         bytes += data.len() as u64;
     }
-    report("srtrust receiver", bytes, start.elapsed(), payload);
+    let window = first.map_or_else(|| start.elapsed(), |f| last - f);
+    report("srtrust receiver", bytes, window, payload);
 }

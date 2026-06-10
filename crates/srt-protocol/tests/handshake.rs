@@ -140,7 +140,14 @@ fn handshake_completes_over_a_perfect_link() {
         })
         .expect("caller Connected");
     assert_eq!(connected.peer_socket_id, SocketId::new(LISTENER_ID));
-    assert_eq!(connected.peer_initial_seq, SeqNumber::new(LISTENER_ISN));
+    // HSv5 is a single-ISN model: the acceptor ADOPTS the caller's ISN for its
+    // own sending and echoes it in the conclusion response (libsrt
+    // `acceptAndRespond`: "use peer's ISN and send it back for security
+    // check"). A blocking-connect libsrt caller REJECTS a response whose ISN
+    // is not its own (`startConnect`: `m_ConnRes.m_iISN != m_iISN` →
+    // MN_SECURITY) — found live via srt-cbench; `srt-live-transmit` masked it
+    // by connecting non-blockingly.
+    assert_eq!(connected.peer_initial_seq, SeqNumber::new(CALLER_ISN));
     assert_eq!(connected.latency, Duration::from_millis(LATENCY_MS));
 
     // The accepted side learned the caller's identity.

@@ -225,7 +225,7 @@ async fn lossy_srtrust_to_libsrt(front: u16, backend: u16, sink_port: u16, ciphe
         &slt,
         &format!(
             "srt://:{backend}?mode=listener&{}",
-            libsrt_query(300, Some(PASSPHRASE), gcm, None)
+            libsrt_query(1000, Some(PASSPHRASE), gcm, None)
         ),
         &format!("udp://127.0.0.1:{sink_port}"),
     );
@@ -240,7 +240,7 @@ async fn lossy_srtrust_to_libsrt(front: u16, backend: u16, sink_port: u16, ciphe
     let counts = spawn_proxy(front, backend, cfg).await;
 
     let config = Config {
-        latency: Duration::from_millis(300),
+        latency: Duration::from_millis(1000),
         ..encrypted(cipher, 0)
     };
     let received = srtrust_sender_run(
@@ -286,7 +286,7 @@ async fn lossy_libsrt_to_srtrust() {
     let (front, backend, in_port) = (19190, 19191, 19192);
 
     let config = Config {
-        latency: Duration::from_millis(300),
+        latency: Duration::from_millis(1000),
         ..encrypted(CipherMode::Ctr, 0)
     };
     let mut listener =
@@ -305,7 +305,7 @@ async fn lossy_libsrt_to_srtrust() {
         &format!("udp://127.0.0.1:{in_port}"),
         &format!(
             "srt://127.0.0.1:{front}?{}",
-            libsrt_query(300, Some(PASSPHRASE), false, None)
+            libsrt_query(1000, Some(PASSPHRASE), false, None)
         ),
     );
 

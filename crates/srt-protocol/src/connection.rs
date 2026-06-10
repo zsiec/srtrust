@@ -454,13 +454,23 @@ impl Connection {
     pub(crate) fn accept(
         config: Config,
         local_socket_id: SocketId,
-        local_initial_seq: SeqNumber,
+        _local_initial_seq: SeqNumber,
         caller_hs: &Handshake,
         now: Instant,
     ) -> Result<Self, ConnectionError> {
         let negotiated = negotiate(config.latency, caller_hs);
         // Set up encryption from the caller's KMREQ, if the connection uses it.
         let (crypto, key_material) = accept_crypto(config.encryption.as_ref(), caller_hs)?;
+
+        // HSv5 is a single-ISN model: the acceptor ADOPTS the caller's ISN for
+        // its own sending and echoes it in the conclusion response (libsrt
+        // `acceptAndRespond`: "use peer's ISN and send it back for security
+        // check"). A blocking-connect libsrt caller rejects a response carrying
+        // any other ISN (`startConnect`'s `m_ConnRes.m_iISN != m_iISN` →
+        // security abort); `srt-live-transmit` never noticed because its
+        // non-blocking connect path skips that check. The listener-supplied
+        // initial sequence is therefore unused here.
+        let initial_seq = caller_hs.initial_seq;
 
         // Advertise the agreed latency back to the caller (spec §4.3.1.2: latency
         // is the greater of the two reported values).
@@ -479,7 +489,7 @@ impl Connection {
             version: HS_VERSION_SRT,
             encryption: caller_hs.encryption,
             extension_field,
-            initial_seq: local_initial_seq,
+            initial_seq,
             mtu: config.mtu,
             max_flow_window: config.flow_window,
             handshake_type: HandshakeType::CONCLUSION,
@@ -492,7 +502,7 @@ impl Connection {
         let mut conn = Self::new_base(
             config,
             local_socket_id,
-            local_initial_seq,
+            initial_seq,
             now,
             Side::Acceptor,
             State::Conclusion,

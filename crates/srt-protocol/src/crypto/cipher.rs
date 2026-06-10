@@ -238,3 +238,45 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod speed_probe {
+    use super::*;
+
+    /// Raw cipher throughput probe; ignored in normal runs (the software
+    /// fallback makes it crawl in debug builds). Run with:
+    /// `cargo test --release -p srt-protocol cipher_throughput_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore = "throughput probe; run explicitly with --release"]
+    fn cipher_throughput_probe() {
+        let key = [0x11u8; 16];
+        let salt = [0x22u8; 16];
+        let payload = vec![0xABu8; 1316];
+        let n = 100_000u32;
+
+        let start = std::time::Instant::now();
+        let mut buf = payload.clone();
+        for seq in 0..n {
+            buf.copy_from_slice(&payload);
+            apply_ctr(&key, &salt, seq, &mut buf).unwrap();
+        }
+        let e = start.elapsed().as_secs_f64();
+        eprintln!(
+            "CTR encrypt: {:.0} Mbps ({:.1} us/pkt)",
+            f64::from(n) * 1316.0 * 8.0 / 1e6 / e,
+            e * 1e6 / f64::from(n)
+        );
+
+        let aad = [0x33u8; 16];
+        let start = std::time::Instant::now();
+        for seq in 0..n {
+            let _ = gcm_encrypt(&key, &salt, seq, &aad, &payload).unwrap();
+        }
+        let e = start.elapsed().as_secs_f64();
+        eprintln!(
+            "GCM encrypt: {:.0} Mbps ({:.1} us/pkt)",
+            f64::from(n) * 1316.0 * 8.0 / 1e6 / e,
+            e * 1e6 / f64::from(n)
+        );
+    }
+}
