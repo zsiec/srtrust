@@ -62,4 +62,9 @@ pub struct Stats {
     /// The **negotiated** TSBPD latency, milliseconds — the larger of the two
     /// advertised values (spec §4.3.1.2), not necessarily what was configured.
     pub latency_ms: u32,
+    /// Received data packets dropped because the receive side was full
+    /// (buffered + undrained data ≥ the flow window). Nonzero means the peer
+    /// kept sending into an advertised window of zero — local enforcement of
+    /// the window this side advertises in every ACK (spec §3.2.4).
+    pub packets_dropped_full: u64,
 }

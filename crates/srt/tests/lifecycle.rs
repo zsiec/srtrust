@@ -46,7 +46,8 @@ async fn dropping_a_stream_closes_the_connection_for_the_peer() {
 /// is served normally.
 #[tokio::test]
 async fn dropping_a_request_undecided_leaves_the_listener_healthy() {
-    let mut listener = SrtListener::bind("127.0.0.1:0".parse().unwrap(), config()).unwrap();
+    let mut listener =
+        SrtListener::bind_deferred("127.0.0.1:0".parse().unwrap(), config()).unwrap();
     let addr = listener.local_addr();
 
     // An ignored caller with a short timeout, so the test stays fast.

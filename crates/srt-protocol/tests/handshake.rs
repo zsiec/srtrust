@@ -123,7 +123,11 @@ fn handshake_completes_over_a_perfect_link() {
         "both sides must reach Connected over a lossless link"
     );
 
-    // The caller learned the listener's identity and the negotiated latency.
+    // The caller learned its peer's identity and the negotiated latency. The
+    // peer is the *accepted connection*, which carries its own minted socket
+    // id (cf. libsrt, where every accepted socket has its own id — the basis
+    // for demultiplexing by destination socket id), distinct from the
+    // listener's.
     let connected = pair
         .caller_events()
         .iter()
@@ -132,7 +136,8 @@ fn handshake_completes_over_a_perfect_link() {
             _ => None,
         })
         .expect("caller Connected");
-    assert_eq!(connected.peer_socket_id, SocketId::new(LISTENER_ID));
+    assert_ne!(connected.peer_socket_id, SocketId::new(LISTENER_ID));
+    assert_ne!(connected.peer_socket_id.value(), 0);
     // HSv5 is a single-ISN model: the acceptor ADOPTS the caller's ISN for its
     // own sending and echoes it in the conclusion response (libsrt
     // `acceptAndRespond`: "use peer's ISN and send it back for security

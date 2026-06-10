@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
-use driver::{Decision, Inbound, StreamChannels, drive_connection, drive_endpoint};
+use driver::{Decision, Inbound, Incoming, StreamChannels, drive_connection, drive_endpoint};
 use srt_protocol::packet::SocketId;
 use srt_protocol::seq::SeqNumber;
 use stream::StreamMeta;
@@ -108,16 +108,9 @@ pub async fn connect_with<R: Runtime>(
     };
 
     let driver_runtime = runtime.clone();
+    let peer = driver::PeerAddr::new(remote);
     runtime.spawn(Box::pin(async move {
-        drive_connection(
-            driver_runtime,
-            socket,
-            conn,
-            remote,
-            channels,
-            Inbound::Owned,
-        )
-        .await;
+        drive_connection(driver_runtime, socket, conn, peer, channels, Inbound::Owned).await;
     }));
 
     match connected_rx.await {
@@ -138,12 +131,14 @@ pub async fn connect_with<R: Runtime>(
 
 /// A listening SRT endpoint that accepts incoming connections.
 ///
-/// A caller's handshake completes when this application answers its request —
-/// via [`accept`](SrtListener::accept) (auto-accept), or
-/// [`incoming`](SrtListener::incoming) followed by the [`ConnRequest`]'s
-/// `accept`/`reject` (inspect the Stream ID first). Keep one of them running
-/// while callers connect: an unanswered caller waits, retransmitting, until
-/// its connect timeout.
+/// By default ([`bind`](SrtListener::bind)) the listener completes every
+/// valid handshake immediately into a backlog — a caller's `connect` resolves
+/// with no application involvement, exactly like libsrt — and
+/// [`accept`](SrtListener::accept) hands the established streams over. To vet
+/// callers (inspect the Stream ID, reject with a real SRT rejection code)
+/// bind with [`bind_deferred`](SrtListener::bind_deferred) and consume
+/// [`incoming`](SrtListener::incoming) instead: there, a handshake completes
+/// only when the application accepts the request.
 ///
 /// Dropping the listener shuts its background driver down and releases the UDP
 /// socket. Accepted connections share that socket and receive through the
@@ -152,7 +147,9 @@ pub async fn connect_with<R: Runtime>(
 /// matter.
 #[derive(Debug)]
 pub struct SrtListener {
-    requests_rx: mpsc::Receiver<ConnRequest>,
+    incoming_rx: mpsc::Receiver<Incoming>,
+    /// Deferred (vetting) mode: `incoming()` is only meaningful here.
+    deferred: bool,
     local_addr: SocketAddr,
     /// Held only so its drop resolves the driver's shutdown future.
     _shutdown: oneshot::Sender<()>,
@@ -237,7 +234,10 @@ impl ConnRequest {
 }
 
 impl SrtListener {
-    /// Binds a listener to `addr`.
+    /// Binds a listener to `addr` in the default **backlog** mode: every
+    /// valid handshake completes immediately (the caller's `connect` resolves
+    /// with no application involvement, like libsrt) and
+    /// [`accept`](SrtListener::accept) returns the established streams.
     ///
     /// # Errors
     ///
@@ -259,6 +259,44 @@ impl SrtListener {
         addr: SocketAddr,
         config: Config,
     ) -> Result<SrtListener> {
+        Self::bind_inner(runtime, addr, config, false)
+    }
+
+    /// Binds a listener to `addr` in **deferred** (vetting) mode: each valid
+    /// handshake is parked and surfaced from [`incoming`](SrtListener::incoming)
+    /// as a [`ConnRequest`]; it completes only when the application accepts
+    /// it, and can be refused with a real SRT rejection code the caller sees.
+    /// While the application decides, the caller retransmits — up to its own
+    /// `connect_timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if `config` fails validation, or [`Error::Io`]
+    /// if the socket cannot be bound.
+    pub fn bind_deferred(addr: SocketAddr, config: Config) -> Result<SrtListener> {
+        Self::bind_deferred_with(&Arc::new(TokioRuntime), addr, config)
+    }
+
+    /// Like [`bind_deferred`](SrtListener::bind_deferred), but driven on a
+    /// caller-supplied [`Runtime`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`bind_deferred`](SrtListener::bind_deferred).
+    pub fn bind_deferred_with<R: Runtime>(
+        runtime: &Arc<R>,
+        addr: SocketAddr,
+        config: Config,
+    ) -> Result<SrtListener> {
+        Self::bind_inner(runtime, addr, config, true)
+    }
+
+    fn bind_inner<R: Runtime>(
+        runtime: &Arc<R>,
+        addr: SocketAddr,
+        config: Config,
+        deferred: bool,
+    ) -> Result<SrtListener> {
         config.validate()?;
         let socket = runtime.bind(addr)?;
         let local_addr = socket.local_addr()?;
@@ -270,11 +308,11 @@ impl SrtListener {
             random_u64(),
             runtime.now(),
         );
-        // Every conclusion surfaces as a ConnRequest; `accept()` is just the
-        // auto-accepting convenience over `incoming()`.
+        // The core always parks conclusions; the driver either accepts them
+        // on the spot (backlog mode) or surfaces them (deferred mode).
         listener.defer_accepts();
 
-        let (requests_tx, requests_rx) = mpsc::channel(driver::COMMAND_CAPACITY);
+        let (incoming_tx, incoming_rx) = mpsc::channel(driver::COMMAND_CAPACITY);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let driver_runtime = runtime.clone();
         runtime.spawn(Box::pin(async move {
@@ -283,7 +321,8 @@ impl SrtListener {
                 socket,
                 listener,
                 local_addr,
-                requests_tx,
+                !deferred,
+                incoming_tx,
                 shutdown_rx,
             )
             .await;
@@ -291,32 +330,51 @@ impl SrtListener {
 
         tracing::info!(addr = %local_addr, "listening");
         Ok(SrtListener {
-            requests_rx,
+            incoming_rx,
+            deferred,
             local_addr,
             _shutdown: shutdown_tx,
         })
     }
 
-    /// Waits for and returns the next connection request, for the application
-    /// to inspect ([`ConnRequest::stream_id`], [`ConnRequest::remote_addr`])
-    /// and then [`accept`](ConnRequest::accept) or
-    /// [`reject`](ConnRequest::reject).
+    /// Waits for and returns the next connection request (deferred mode), for
+    /// the application to inspect ([`ConnRequest::stream_id`],
+    /// [`ConnRequest::remote_addr`]) and then [`accept`](ConnRequest::accept)
+    /// or [`reject`](ConnRequest::reject).
+    ///
+    /// # Panics
+    ///
+    /// Panics on a default (backlog-mode) listener — its handshakes already
+    /// completed, so there is nothing to vet. Bind with
+    /// [`bind_deferred`](SrtListener::bind_deferred) to use this.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Closed`] if the listener's driver has stopped.
     pub async fn incoming(&mut self) -> Result<ConnRequest> {
-        self.requests_rx.recv().await.ok_or(Error::Closed)
+        assert!(
+            self.deferred,
+            "incoming() requires a vetting listener; bind it with SrtListener::bind_deferred"
+        );
+        match self.incoming_rx.recv().await.ok_or(Error::Closed)? {
+            Incoming::Request(request) => Ok(request),
+            Incoming::Stream(_) => unreachable!("a deferred listener never auto-accepts"),
+        }
     }
 
-    /// Waits for and returns the next accepted connection — the auto-accept
-    /// convenience over [`incoming`](SrtListener::incoming).
+    /// Waits for and returns the next accepted connection: an established
+    /// stream from the backlog (default mode), or — on a
+    /// [`bind_deferred`](SrtListener::bind_deferred) listener — the next
+    /// request, auto-accepted.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Closed`] if the listener's driver has stopped.
     pub async fn accept(&mut self) -> Result<SrtStream> {
-        self.incoming().await?.accept().await
+        match self.incoming_rx.recv().await.ok_or(Error::Closed)? {
+            Incoming::Stream(stream) => Ok(stream),
+            Incoming::Request(request) => request.accept().await,
+        }
     }
 
     /// The local address the listener is bound to.

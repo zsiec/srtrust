@@ -97,6 +97,9 @@ pub struct Listener {
     pending: Vec<PendingConn>,
     /// Surfaced requests awaiting [`Listener::poll_request`].
     requests: VecDeque<ConnRequest>,
+    /// Counter behind [`Listener::mint_socket_id`]: each accepted connection
+    /// gets its own local socket id.
+    accept_counter: u32,
 }
 
 impl Listener {
@@ -123,6 +126,21 @@ impl Listener {
             deferred: false,
             pending: Vec::new(),
             requests: VecDeque::new(),
+            accept_counter: 0,
+        }
+    }
+
+    /// Mints a unique local socket id for the next accepted connection (cf.
+    /// libsrt, where every accepted socket has its own id): the listener's id
+    /// XOR a running counter — never zero (zero addresses the listener itself,
+    /// spec §4.3.1.2) and never the listener's own id.
+    fn mint_socket_id(&mut self) -> SocketId {
+        loop {
+            self.accept_counter = self.accept_counter.wrapping_add(1);
+            let id = self.local_socket_id.value() ^ self.accept_counter;
+            if id != 0 && id != self.local_socket_id.value() {
+                return SocketId::new(id);
+            }
         }
     }
 
@@ -195,9 +213,10 @@ impl Listener {
             self.park_conclusion(conclusion, from, now);
             return;
         }
+        let conn_id = self.mint_socket_id();
         match Connection::accept(
             self.config.clone(),
-            self.local_socket_id,
+            conn_id,
             self.local_initial_seq,
             conclusion,
             now,
@@ -262,9 +281,10 @@ impl Listener {
             return Err(ConnectionError::InvalidState);
         };
         let parked = self.pending.swap_remove(index);
+        let conn_id = self.mint_socket_id();
         Connection::accept(
             self.config.clone(),
-            self.local_socket_id,
+            conn_id,
             self.local_initial_seq,
             &parked.conclusion,
             now,

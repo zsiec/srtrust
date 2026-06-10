@@ -54,11 +54,11 @@ async fn main() -> srt::Result<()> {
 }
 ```
 
-**One thing to know:** a caller's handshake completes when the listener
-application *accepts* it. Keep `accept()` (or `incoming()`) running while
-callers connect — a caller awaited with nobody accepting waits until its
-`connect_timeout` (default 3 s). In practice every server looks like the
-accept-loop above.
+A caller's handshake completes into the listener's backlog with no
+application involvement (libsrt-compatible); `accept()` hands the established
+streams over. To vet callers *before* the handshake completes, bind with
+`SrtListener::bind_deferred` and consume `incoming()` instead — there, a
+handshake finishes only when the application accepts it.
 
 ## Recipes
 
@@ -70,15 +70,19 @@ at `connect`/`bind`); the handshake refuses mismatches with a clear error:
 let config = Config::default().with_passphrase("correct horse battery");
 ```
 
-**Vet callers before accepting** — `incoming()` exposes who is calling and the
-Stream ID they advertised (the "which resource, which credentials" field), and
-lets you reject with a real SRT rejection code the caller can read:
+**Vet callers before accepting** — a `bind_deferred` listener surfaces each
+caller from `incoming()` with the Stream ID it advertised (the "which
+resource, which credentials" field), and lets you reject with a real SRT
+rejection code the caller can read:
 
 ```rust,no_run
-# async fn vet(listener: &mut srt::SrtListener) -> srt::Result<()> {
-use srt::RejectReason;
+# async fn vet() -> srt::Result<()> {
+use srt::{Config, RejectReason, SrtListener};
+
+let mut listener = SrtListener::bind_deferred("0.0.0.0:9000".parse().unwrap(), Config::default())?;
 
 let request = listener.incoming().await?;
+# // (loop over incoming() in a real server)
 match request.stream_id() {
     Some(id) if id.starts_with("live/") => {
         let stream = request.accept().await?;

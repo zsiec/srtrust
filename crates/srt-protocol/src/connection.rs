@@ -822,6 +822,15 @@ impl Connection {
         }
     }
 
+    /// This connection's own (local) socket id — what the peer addresses in
+    /// every packet's destination-socket-id field. Unique per accepted
+    /// connection on a listener, which is what makes demultiplexing by id
+    /// possible.
+    #[must_use]
+    pub fn local_socket_id(&self) -> SocketId {
+        self.local_socket_id
+    }
+
     /// A snapshot of this connection's cumulative [`Stats`]: the running counters
     /// plus the current RTT, in-flight window, and receive-buffer occupancy.
     #[must_use]

@@ -7,7 +7,7 @@
 //!
 //! Shared across test binaries; not every binary uses every helper, hence the
 //! module-level `dead_code` allow.
-#![allow(dead_code, unreachable_pub)]
+#![allow(dead_code, unreachable_pub, unused_macros, unused_imports)]
 
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -133,6 +133,16 @@ pub fn spawn_slt_args(slt: &str, extra: &[&str], input: &str, output: &str) -> K
             .spawn()
             .expect("spawn srt-live-transmit"),
     )
+}
+
+/// The one-way delay for one forwarded datagram: the fixed base plus a
+/// seeded uniform draw from `0..jitter`.
+fn effective_delay(cfg: &ProxyCfg, rng: &mut Rng) -> Duration {
+    if cfg.jitter.is_zero() {
+        cfg.delay
+    } else {
+        cfg.delay + cfg.jitter.mul_f64(rng.next_unit())
+    }
 }
 
 /// URI query string for a libsrt endpoint with optional encryption/rekey knobs.
@@ -264,6 +274,10 @@ pub struct ProxyCfg {
     pub seed: u64,
     /// Fixed extra one-way delay applied to every forwarded datagram.
     pub delay: Duration,
+    /// Extra per-datagram uniform random delay in `0..jitter` (seeded). With
+    /// jitter larger than the inter-packet gap, datagrams reorder — like a
+    /// real WAN path.
+    pub jitter: Duration,
     /// Targeted drop on the caller→listener direction (`true` = drop).
     pub c2l_drop: Option<DropFilter>,
     /// Targeted drop on the listener→caller direction (`true` = drop).
@@ -277,6 +291,7 @@ impl Default for ProxyCfg {
             l2c_loss: 0.0,
             seed: 1,
             delay: Duration::ZERO,
+            jitter: Duration::ZERO,
             c2l_drop: None,
             l2c_drop: None,
         }
@@ -319,11 +334,11 @@ pub async fn spawn_proxy(front_port: u16, backend_port: u16, mut cfg: ProxyCfg) 
                         task_counts.dropped.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    if cfg.delay.is_zero() {
+                    let delay = effective_delay(&cfg, &mut rng);
+                    if delay.is_zero() {
                         let _ = back.send(&datagram).await;
                     } else {
                         let back = back.clone();
-                        let delay = cfg.delay;
                         tokio::spawn(async move {
                             tokio::time::sleep(delay).await;
                             let _ = back.send(&datagram).await;
@@ -340,11 +355,11 @@ pub async fn spawn_proxy(front_port: u16, backend_port: u16, mut cfg: ProxyCfg) 
                         task_counts.dropped.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    if cfg.delay.is_zero() {
+                    let delay = effective_delay(&cfg, &mut rng);
+                    if delay.is_zero() {
                         let _ = front.send_to(&datagram, to).await;
                     } else {
                         let front = front.clone();
-                        let delay = cfg.delay;
                         tokio::spawn(async move {
                             tokio::time::sleep(delay).await;
                             let _ = front.send_to(&datagram, to).await;

@@ -63,7 +63,8 @@ async fn lifecycle_events_are_traced() {
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
         .expect("first and only global subscriber");
 
-    let mut listener = SrtListener::bind("127.0.0.1:0".parse().unwrap(), config()).unwrap();
+    let mut listener =
+        SrtListener::bind_deferred("127.0.0.1:0".parse().unwrap(), config()).unwrap();
     let addr = listener.local_addr();
     capture.assert_event(&["srt", "listening"]);
 

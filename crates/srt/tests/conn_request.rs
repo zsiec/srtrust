@@ -14,7 +14,8 @@ fn config() -> Config {
 
 #[tokio::test]
 async fn incoming_surfaces_stream_id_and_addr_and_accept_connects() {
-    let mut listener = SrtListener::bind("127.0.0.1:0".parse().unwrap(), config()).unwrap();
+    let mut listener =
+        SrtListener::bind_deferred("127.0.0.1:0".parse().unwrap(), config()).unwrap();
     let addr = listener.local_addr();
 
     let client = tokio::spawn(async move {
@@ -47,7 +48,8 @@ async fn incoming_surfaces_stream_id_and_addr_and_accept_connects() {
 
 #[tokio::test]
 async fn reject_reaches_the_caller_with_the_reason() {
-    let mut listener = SrtListener::bind("127.0.0.1:0".parse().unwrap(), config()).unwrap();
+    let mut listener =
+        SrtListener::bind_deferred("127.0.0.1:0".parse().unwrap(), config()).unwrap();
     let addr = listener.local_addr();
 
     let client =

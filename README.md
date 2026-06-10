@@ -97,15 +97,19 @@ async fn main() -> srt::Result<()> {
 
 Good to know, up front:
 
-- **A caller's handshake completes when the listener app accepts it** — keep an
-  `accept()`/`incoming()` loop running while callers connect (every server
-  looks like the loop above).
-- **Vetting callers:** `listener.incoming()` yields a `ConnRequest` exposing
-  the caller's Stream ID and address, with `accept().await` /
-  `reject(reason)` — the rejection reaches the caller as a real SRT rejection
-  code instead of a timeout.
+- **Handshakes complete into a backlog** (libsrt-compatible): a caller's
+  `connect` resolves as soon as the wire handshake finishes; `accept()` hands
+  the established streams over.
+- **Vetting callers:** bind with `SrtListener::bind_deferred` and consume
+  `listener.incoming()` — each `ConnRequest` exposes the caller's Stream ID
+  and address, with `accept().await` / `reject(reason)`; the rejection reaches
+  the caller as a real SRT rejection code instead of a timeout, and the
+  handshake completes only on accept.
 - **Invalid config fails fast:** a 5-character passphrase or 20-byte MTU is
   rejected at `connect`/`bind` with a `ConfigError` saying why.
+- **Connections survive NAT rebinds:** every accepted connection has its own
+  socket id, so a peer whose source address changes mid-stream is re-pinned,
+  not dropped.
 
 The [`srt` crate README](./crates/srt/README.md) has copy-paste recipes for
 encryption, caller vetting, task-splitting (`into_split`), `futures`

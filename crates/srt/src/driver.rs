@@ -67,6 +67,28 @@ impl Inbound {
     }
 }
 
+/// A connection's peer address, shared between its driver (which sends to
+/// it) and the endpoint demux (which re-pins it when the same connection —
+/// identified by destination socket id — starts arriving from a new address,
+/// i.e. a NAT rebind). A plain mutex: read once per driver iteration,
+/// written almost never.
+#[derive(Debug, Clone)]
+pub(crate) struct PeerAddr(Arc<std::sync::Mutex<SocketAddr>>);
+
+impl PeerAddr {
+    pub(crate) fn new(addr: SocketAddr) -> Self {
+        PeerAddr(Arc::new(std::sync::Mutex::new(addr)))
+    }
+
+    fn get(&self) -> SocketAddr {
+        *self.0.lock().expect("peer-addr lock is never poisoned")
+    }
+
+    fn set(&self, addr: SocketAddr) {
+        *self.0.lock().expect("peer-addr lock is never poisoned") = addr;
+    }
+}
+
 /// Application → driver commands.
 #[derive(Debug)]
 pub(crate) enum Command {
@@ -94,7 +116,7 @@ pub(crate) async fn drive_connection<R: Runtime>(
     runtime: Arc<R>,
     socket: Arc<dyn AsyncUdpSocket>,
     mut conn: Connection,
-    peer: SocketAddr,
+    peer_addr: PeerAddr,
     mut channels: StreamChannels,
     mut inbound: Inbound,
 ) {
@@ -120,6 +142,9 @@ pub(crate) async fn drive_connection<R: Runtime>(
 
     loop {
         let now = runtime.now();
+        // Re-read each iteration: the endpoint demux re-pins this when the
+        // peer's address changes mid-stream (NAT rebind).
+        let peer = peer_addr.get();
         // Fire any already-due timers first. tokio's `select!` is free to keep
         // choosing an always-ready socket branch under a heavy inbound flood, so
         // firing timers up front here (rather than only in a select branch) keeps
@@ -228,11 +253,23 @@ pub(crate) async fn drive_connection<R: Runtime>(
             }
         }
     }
-    tracing::debug!(%peer, "connection driver stopped");
+    tracing::debug!(peer = %peer_addr.get(), "connection driver stopped");
 }
 
 /// The application channel ends a freshly-accepted connection is reached through.
 pub(crate) type Accepted = (mpsc::Sender<Command>, mpsc::Receiver<Bytes>);
+
+/// What a listener hands its application, in arrival order: an
+/// already-established stream (auto-accept/backlog mode, the default) or a
+/// connection request awaiting a decision (deferred mode). One listener only
+/// ever produces one of the two variants — `SrtListener::accept`/`incoming`
+/// match accordingly.
+pub(crate) enum Incoming {
+    /// Auto-accept: the handshake completed into the backlog.
+    Stream(crate::SrtStream),
+    /// Deferred: the application must accept or reject.
+    Request(crate::ConnRequest),
+}
 
 /// A [`crate::ConnRequest`] decision travelling back to the endpoint driver.
 pub(crate) enum Decision {
@@ -272,13 +309,20 @@ pub(crate) async fn drive_endpoint<R: Runtime>(
     socket: Arc<dyn AsyncUdpSocket>,
     mut listener: Listener,
     local_addr: SocketAddr,
-    requests_tx: mpsc::Sender<crate::ConnRequest>,
+    auto_accept: bool,
+    incoming_tx: mpsc::Sender<Incoming>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
     let mut recv_buf = vec![0u8; RECV_BUF];
-    // Established connections, keyed by peer address; the value forwards inbound
-    // datagrams (paired with their arrival time) to that connection's driver task.
+    // Established connections, keyed by peer address (the fast path; a UDP
+    // flow's source address is stable) — the value forwards inbound datagrams
+    // (paired with their arrival time) to that connection's driver task.
     let mut connections: HashMap<SocketAddr, mpsc::Sender<(Instant, Bytes)>> = HashMap::new();
+    // The same connections keyed by their local socket id — every packet the
+    // peer sends carries it as the destination socket id (spec §3.1), so a
+    // datagram from an *unknown* address can still be claimed by its
+    // connection (NAT rebind) instead of being mistaken for a handshake.
+    let mut by_id: HashMap<u32, IdEntry> = HashMap::new();
     // Decisions flow back from `ConnRequest` handles. The sender side is cloned
     // into every surfaced request; this receiver never closes because we hold a
     // sender too.
@@ -293,9 +337,16 @@ pub(crate) async fn drive_endpoint<R: Runtime>(
             received = poll_fn(|cx| socket.poll_recv_gro(cx, &mut recv_buf)) => received,
             decision = decisions_rx.recv() => {
                 let Some(decision) = decision else { continue };
-                if apply_decision(&runtime, &socket, &mut listener, &mut connections, decision)
-                    .await
-                    .is_err()
+                if apply_decision(
+                    &runtime,
+                    &socket,
+                    &mut listener,
+                    &mut connections,
+                    &mut by_id,
+                    decision,
+                )
+                .await
+                .is_err()
                 {
                     return;
                 }
@@ -314,17 +365,35 @@ pub(crate) async fn drive_endpoint<R: Runtime>(
         // Established peer: hand each datagram to its driver and move on. A single
         // GRO read from one peer may carry several coalesced datagrams.
         if let Some(tx) = connections.get(&from) {
-            for segment in gro_split(&recv_buf, len, stride) {
-                match tx.try_send((now, Bytes::copy_from_slice(segment))) {
-                    // Delivered, or the driver is swamped (drop and let ARQ recover
-                    // the packet) — either way the demux loop never blocks here.
-                    Ok(()) | Err(TrySendError::Full(_)) => {}
-                    // The driver is gone; forget it (a future caller may reuse the addr).
-                    Err(TrySendError::Closed(_)) => {
-                        connections.remove(&from);
-                        break;
-                    }
-                }
+            if !forward_segments(tx, &recv_buf, len, stride, now) {
+                // The driver is gone; forget it (a future caller may reuse the addr).
+                connections.remove(&from);
+            }
+            continue;
+        }
+
+        // Unknown address, but the destination socket id may identify an
+        // established connection whose peer rebound (NAT mapping reassigned):
+        // re-pin that connection to the new address — inbound demux and the
+        // driver's outbound sends both follow — and forward as usual.
+        if let Some(id) = gro_split(&recv_buf, len, stride)
+            .next()
+            .and_then(dest_socket_id)
+            && let Some(entry) = by_id.get_mut(&id)
+        {
+            tracing::info!(
+                socket_id = id,
+                old = %entry.addr,
+                new = %from,
+                "peer address changed; re-pinning"
+            );
+            connections.remove(&entry.addr);
+            connections.insert(from, entry.tx.clone());
+            entry.addr = from;
+            entry.peer.set(from);
+            if !forward_segments(&entry.tx, &recv_buf, len, stride, now) {
+                connections.remove(&from);
+                by_id.remove(&id);
             }
             continue;
         }
@@ -341,32 +410,21 @@ pub(crate) async fn drive_endpoint<R: Runtime>(
         // the app fell behind (BUG-05g, docs/known-issues/05). A full backlog
         // rejects the caller outright (`SRT_REJ_BACKLOG`), like a full TCP SYN
         // backlog but with an answer instead of silence.
-        while let Some(request) = listener.poll_request() {
-            let addr = request.remote_addr();
-            tracing::debug!(
-                remote = %addr,
-                stream_id = ?request.stream_id(),
-                "connection request"
-            );
-            let request = crate::ConnRequest {
-                stream_id: request.stream_id().map(str::to_owned),
-                remote_addr: addr,
-                local_addr,
-                decisions: decisions_tx.clone(),
-            };
-            match requests_tx.try_send(request) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    tracing::warn!(remote = %addr, "request backlog full; rejecting");
-                    listener.reject_pending(
-                        addr,
-                        srt_protocol::handshake::RejectReason::Backlog,
-                        now,
-                    );
-                }
-                // The application dropped the listener handle.
-                Err(TrySendError::Closed(_)) => return,
-            }
+        if surface_requests(
+            &runtime,
+            &socket,
+            &mut listener,
+            &mut connections,
+            &mut by_id,
+            local_addr,
+            auto_accept,
+            &incoming_tx,
+            &decisions_tx,
+            now,
+        )
+        .is_err()
+        {
+            return; // the application dropped the listener handle
         }
         if flush_listener_responses(&socket, &mut listener)
             .await
@@ -375,6 +433,77 @@ pub(crate) async fn drive_endpoint<R: Runtime>(
             return;
         }
     }
+}
+
+/// Hands every newly-surfaced conclusion to the application: in auto-accept
+/// (backlog) mode the handshake is completed on the spot and the established
+/// stream queued; in deferred mode a [`crate::ConnRequest`] is queued for the
+/// application's decision. A full backlog rejects the caller
+/// (`SRT_REJ_BACKLOG`). `Err` means the application dropped its handle.
+#[allow(clippy::too_many_arguments)] // a private seam of one driver loop
+fn surface_requests<R: Runtime>(
+    runtime: &Arc<R>,
+    socket: &Arc<dyn AsyncUdpSocket>,
+    listener: &mut Listener,
+    connections: &mut HashMap<SocketAddr, mpsc::Sender<(Instant, Bytes)>>,
+    by_id: &mut HashMap<u32, IdEntry>,
+    local_addr: SocketAddr,
+    auto_accept: bool,
+    incoming_tx: &mpsc::Sender<Incoming>,
+    decisions_tx: &mpsc::Sender<Decision>,
+    now: Instant,
+) -> Result<(), ()> {
+    while let Some(request) = listener.poll_request() {
+        let addr = request.remote_addr();
+        tracing::debug!(
+            remote = %addr,
+            stream_id = ?request.stream_id(),
+            "connection request"
+        );
+        // Reserve the application's slot *before* deciding anything, so a
+        // full backlog rejects the caller (`SRT_REJ_BACKLOG`) instead of
+        // establishing a connection nobody will ever own.
+        let permit = match incoming_tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(TrySendError::Full(())) => {
+                tracing::warn!(remote = %addr, "backlog full; rejecting");
+                listener.reject_pending(addr, srt_protocol::handshake::RejectReason::Backlog, now);
+                continue;
+            }
+            // The application dropped the listener handle.
+            Err(TrySendError::Closed(())) => return Err(()),
+        };
+        if auto_accept {
+            // Backlog semantics (libsrt/srtgo): complete the handshake right
+            // now — the caller's connect resolves with no application
+            // involvement — and queue the established stream.
+            let stream_id = request.stream_id().map(str::to_owned);
+            if let Ok((commands, data)) =
+                spawn_accepted(runtime, socket, listener, connections, by_id, addr, now)
+            {
+                let stream = crate::SrtStream::new(
+                    commands,
+                    data,
+                    crate::stream::StreamMeta {
+                        local_addr,
+                        peer_addr: addr,
+                        stream_id,
+                    },
+                );
+                permit.send(Incoming::Stream(stream));
+            }
+            // On error the core already queued the wire rejection; the
+            // unused permit just drops.
+        } else {
+            permit.send(Incoming::Request(crate::ConnRequest {
+                stream_id: request.stream_id().map(str::to_owned),
+                remote_addr: addr,
+                local_addr,
+                decisions: decisions_tx.clone(),
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// Applies one application accept/reject [`Decision`] to the core listener:
@@ -386,48 +515,111 @@ async fn apply_decision<R: Runtime>(
     socket: &Arc<dyn AsyncUdpSocket>,
     listener: &mut Listener,
     connections: &mut HashMap<SocketAddr, mpsc::Sender<(Instant, Bytes)>>,
+    by_id: &mut HashMap<u32, IdEntry>,
     decision: Decision,
 ) -> Result<(), ()> {
     let now = runtime.now();
     match decision {
-        Decision::Accept { addr, reply } => match listener.accept_pending(addr, now) {
-            Ok(conn) => {
-                tracing::info!(remote = %addr, "accepted");
-                // Evict demux entries whose connection driver has since ended
-                // (their channel receiver is gone). Without this sweep a
-                // long-running listener accumulates one dead entry per closed
-                // peer that never sends another datagram.
-                connections.retain(|_, tx| !tx.is_closed());
-                let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
-                let (data_tx, data_rx) = mpsc::channel(DATA_CAPACITY);
-                let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CAPACITY);
-                connections.insert(addr, inbound_tx);
-                let channels = StreamChannels {
-                    commands: commands_rx,
-                    data: data_tx,
-                    connected: None, // the acceptor is already connected
-                };
-                runtime.spawn(Box::pin(drive_connection(
-                    runtime.clone(),
-                    socket.clone(),
-                    conn,
-                    addr,
-                    channels,
-                    Inbound::Demuxed(inbound_rx),
-                )));
-                let _ = reply.send(Ok((commands_tx, data_rx)));
-            }
-            Err(error) => {
-                tracing::warn!(remote = %addr, %error, "accept failed");
-                let _ = reply.send(Err(Error::Protocol(error)));
-            }
-        },
+        Decision::Accept { addr, reply } => {
+            let result = spawn_accepted(runtime, socket, listener, connections, by_id, addr, now)
+                .map_err(Error::Protocol);
+            let _ = reply.send(result);
+        }
         Decision::Reject { addr, reason } => {
             tracing::info!(remote = %addr, %reason, "rejected");
             listener.reject_pending(addr, reason, now);
         }
     }
     flush_listener_responses(socket, listener).await
+}
+
+/// Accepts the pending conclusion from `addr`, registers it in both demux
+/// maps, and spawns its connection driver — returning the application channel
+/// ends. On failure the core has already queued the wire rejection.
+fn spawn_accepted<R: Runtime>(
+    runtime: &Arc<R>,
+    socket: &Arc<dyn AsyncUdpSocket>,
+    listener: &mut Listener,
+    connections: &mut HashMap<SocketAddr, mpsc::Sender<(Instant, Bytes)>>,
+    by_id: &mut HashMap<u32, IdEntry>,
+    addr: SocketAddr,
+    now: Instant,
+) -> Result<Accepted, srt_protocol::error::ConnectionError> {
+    let conn = listener.accept_pending(addr, now).inspect_err(|error| {
+        tracing::warn!(remote = %addr, %error, "accept failed");
+    })?;
+    tracing::info!(remote = %addr, "accepted");
+    // Evict demux entries whose connection driver has since ended (their
+    // channel receiver is gone). Without this sweep a long-running listener
+    // accumulates one dead entry per closed peer that never sends another
+    // datagram.
+    connections.retain(|_, tx| !tx.is_closed());
+    by_id.retain(|_, entry| !entry.tx.is_closed());
+    let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CAPACITY);
+    let (data_tx, data_rx) = mpsc::channel(DATA_CAPACITY);
+    let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_CAPACITY);
+    let peer = PeerAddr::new(addr);
+    connections.insert(addr, inbound_tx.clone());
+    by_id.insert(
+        conn.local_socket_id().value(),
+        IdEntry {
+            tx: inbound_tx,
+            addr,
+            peer: peer.clone(),
+        },
+    );
+    let channels = StreamChannels {
+        commands: commands_rx,
+        data: data_tx,
+        connected: None, // the acceptor is already connected
+    };
+    runtime.spawn(Box::pin(drive_connection(
+        runtime.clone(),
+        socket.clone(),
+        conn,
+        peer,
+        channels,
+        Inbound::Demuxed(inbound_rx),
+    )));
+    Ok((commands_tx, data_rx))
+}
+
+/// One established connection as the id-keyed demux sees it: the forwarding
+/// channel, the address it currently lives at, and the shared peer address its
+/// driver sends to.
+struct IdEntry {
+    tx: mpsc::Sender<(Instant, Bytes)>,
+    addr: SocketAddr,
+    peer: PeerAddr,
+}
+
+/// Forwards every GRO segment of one socket read to a connection's driver,
+/// stamped with its arrival time. A swamped driver drops segments (ARQ
+/// recovers them) so the demux loop never blocks. Returns `false` when the
+/// driver is gone (its channel closed) and the entry should be evicted.
+fn forward_segments(
+    tx: &mpsc::Sender<(Instant, Bytes)>,
+    recv_buf: &[u8],
+    len: usize,
+    stride: usize,
+    now: Instant,
+) -> bool {
+    for segment in gro_split(recv_buf, len, stride) {
+        match tx.try_send((now, Bytes::copy_from_slice(segment))) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Closed(_)) => return false,
+        }
+    }
+    true
+}
+
+/// The destination socket id of a wire packet — the fourth 32-bit word of
+/// both the data and control headers (spec §3.1). `None` for runts.
+fn dest_socket_id(datagram: &[u8]) -> Option<u32> {
+    let bytes = datagram.get(12..16)?;
+    Some(u32::from_be_bytes(
+        bytes.try_into().expect("a 4-byte slice"),
+    ))
 }
 
 /// Sends every response datagram the core listener has queued (induction

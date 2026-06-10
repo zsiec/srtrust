@@ -1419,7 +1419,7 @@ async fn libsrt_streamid_inspected_rejected_then_accepted() {
     let slt = require_libsrt!();
     let (srt_port, in_bad, in_good) = (19440, 19441, 19442);
 
-    let mut listener = SrtListener::bind(
+    let mut listener = SrtListener::bind_deferred(
         format!("127.0.0.1:{srt_port}").parse().unwrap(),
         base_config(),
     )

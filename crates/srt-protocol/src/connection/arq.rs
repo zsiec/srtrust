@@ -532,6 +532,15 @@ impl Connection {
     /// delivery, light-ACKs periodically, and NAKs newly-discovered gaps (spec
     /// §4.5).
     fn insert_data(&mut self, mut data: DataPacket, now: Instant) {
+        // Enforce our advertised receive window locally (spec §3.2.4): a
+        // compliant sender stopped when we advertised zero, so anything
+        // arriving against a full receive side is a peer ignoring the window
+        // — drop it (before paying for decryption) rather than grow without
+        // bound while the application is stalled.
+        if self.available_recv_buffer() == 0 {
+            self.stats.packets_dropped_full += 1;
+            return;
+        }
         // Decrypt the payload before buffering (spec §6.3); the unencrypted seq
         // in the header reconstructs the AES-CTR counter. Decrypt with the key the
         // packet's even/odd flag selects — using the wrong slot would corrupt the
