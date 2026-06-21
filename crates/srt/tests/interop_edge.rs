@@ -176,15 +176,22 @@ async fn srtrust_dropreq_skips_cleanly_at_libsrt() {
         &slt,
         &format!(
             "srt://:{backend}?mode=listener&{}",
-            libsrt_query(120, None, false, None)
+            libsrt_query(1500, None, false, None)
         ),
         &format!("udp://127.0.0.1:{sink_port}"),
     );
     tokio::time::sleep(Duration::from_millis(1300)).await;
 
-    // 100 ms each way: the receiver's local give-up (and the ACK advancing past
-    // the gap) takes a full RTT to reach the sender, so the sender's own
-    // too-late shed fires first and the DROPREQ crosses the wire.
+    // For the sender's own too-late shed (and its DROPREQ) to fire before the
+    // receiver's local give-up + ACK-advance returns, the sender's send-side
+    // TLPKTDROP window must be shorter than receiver-latency + return delay. With
+    // libsrt's window = max(latency, 1000ms) + 2·SYN, a small latency makes the
+    // window ~1020ms while the receiver gives up in ~latency — so the receiver
+    // wins and no DROPREQ crosses (the libsrt-faithful low-latency behaviour). A
+    // large latency flips it: at 1500ms the window is ~1520ms but the receiver's
+    // give-up + 100ms return is ~1600ms, so the sender sheds first and the DROPREQ
+    // reaches libsrt's hardened parser. (This is the regime a libsrt *sender*
+    // would shed in too.)
     let cfg = ProxyCfg {
         c2l_drop: Some(black_hole_nth_original(9)),
         delay: Duration::from_millis(100),
@@ -193,13 +200,13 @@ async fn srtrust_dropreq_skips_cleanly_at_libsrt() {
     let counts = spawn_proxy(front, backend, cfg).await;
 
     let received = srtrust_sender_run(
-        base_config(),
+        base_config().with_latency(Duration::from_millis(1500)),
         front,
         &sink,
         50,
         Duration::from_millis(20),
         64,
-        Duration::from_secs(5),
+        Duration::from_secs(6),
     )
     .await;
     let _ = child.kill();

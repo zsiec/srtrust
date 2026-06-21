@@ -11,7 +11,7 @@ use srt::{CipherMode, Config, EncryptionSettings, FecConfig, KeySize, SrtListene
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, stdout};
 
-/// config_from_flags builds the srtrust Config from the bench's CLI knobs (the
+/// `config_from_flags` builds the srtrust Config from the bench's CLI knobs (the
 /// `--key value` pairs after the positional port). Unset flags keep defaults.
 fn config_from_flags(args: &[String]) -> Config {
     let mut cfg = Config::default();

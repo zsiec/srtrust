@@ -13,10 +13,11 @@ use srt_protocol::seq::SeqNumber;
 
 /// Target send period: 10 ms.
 const PERIOD_US: u64 = 10_000;
-/// SRT packet size for a full payload: 1456 payload + 16 header.
-const PKT_SIZE: u64 = 1472;
+/// On-wire size for a full payload: 1456 payload + 44 wire overhead (IP+UDP+SRT),
+/// matching libsrt's pacing-rate accounting.
+const PKT_SIZE: u64 = 1500;
 /// Maximum bandwidth chosen so a full packet takes exactly `PERIOD_US`.
-const MAX_BW: u64 = PKT_SIZE * 1_000_000 / PERIOD_US; // 147_200 bytes/s
+const MAX_BW: u64 = PKT_SIZE * 1_000_000 / PERIOD_US; // 150_000 bytes/s
 
 fn config(max_bw: u64) -> Config {
     Config::default()

@@ -38,6 +38,11 @@ const LIGHT_ACK_EVERY: u32 = 64;
 const MIN_NAK_INTERVAL: Duration = Duration::from_millis(20);
 /// Floor on the sender's EXP / retransmission timeout (libsrt/srtgo: 300 ms).
 const MIN_EXP_INTERVAL: Duration = Duration::from_millis(300);
+/// Minimum send-side TLPKTDROP threshold (libsrt `SRT_TLPKTDROP_MINTHRESHOLD_MS`):
+/// the sender keeps un-acked packets eligible for retransmission for at least this
+/// long regardless of the (typically much smaller) playout latency, so ARQ has a
+/// real recovery window before a packet is abandoned.
+const SND_DROP_MIN_THRESHOLD: Duration = Duration::from_secs(1);
 /// Most outstanding full ACKs tracked for RTT (bounds `pending_acks`).
 const MAX_PENDING_ACKS: usize = 16;
 /// Cap on the EXP backoff multiplier, so the timeout cannot grow without bound.
@@ -354,7 +359,13 @@ impl Connection {
     /// will never come. A packet whose age exceeds the TSBPD latency cannot arrive
     /// before its play time, so retransmitting it is wasted bandwidth.
     pub(super) fn drop_too_late(&mut self, now: Instant) {
-        let budget = micros_i64(self.latency);
+        // libsrt's send-side TLPKTDROP threshold: max(latency, 1000 ms) + 2·SYN
+        // (10 ms), not the bare playout latency. A packet is only truly
+        // undeliverable once it is older than this window; dropping at bare latency
+        // (e.g. 120 ms) abandons packets ARQ could still recover within libsrt's
+        // ~1020 ms window and emits DROPREQs the peer would otherwise never see.
+        let budget = micros_i64(self.latency).max(micros_i64(SND_DROP_MIN_THRESHOLD))
+            + 2 * micros_i64(ACK_INTERVAL);
         let now_ts = self.wire_ts(now);
         let mut first = None;
         let mut last_dropped = None;

@@ -13,7 +13,7 @@ use srt::{CipherMode, Config, EncryptionSettings, FecConfig, KeySize, connect};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, stdin};
 
-/// config_from_flags builds the srtrust Config from the bench's CLI knobs (the
+/// `config_from_flags` builds the srtrust Config from the bench's CLI knobs (the
 /// `--key value` pairs after the positional address). Unset flags keep defaults.
 fn config_from_flags(args: &[String]) -> Config {
     let mut cfg = Config::default();
@@ -88,7 +88,7 @@ async fn main() {
     let mut buf = vec![0u8; 1316];
     loop {
         match input.read(&mut buf).await {
-            Ok(0) => break, // EOF
+            Ok(0) | Err(_) => break, // EOF or read error: stop
             Ok(n) => {
                 if stream
                     .send(Bytes::copy_from_slice(&buf[..n]))
@@ -98,7 +98,6 @@ async fn main() {
                     break;
                 }
             }
-            Err(_) => break,
         }
     }
 }

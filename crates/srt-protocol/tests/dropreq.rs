@@ -53,25 +53,28 @@ fn connected(c2l: LinkConfig, l2c: LinkConfig, seed: u64) -> Pair {
 
 #[test]
 fn too_late_packets_are_dropped_and_announced() {
-    // Lossy data link, heavily-starved feedback: NAK/ACK rarely get back, so the
-    // sender cannot recover everything inside the 80 ms budget and must shed the
-    // stragglers — announcing each via DROPREQ.
-    let lossy = LinkConfig {
-        loss: 0.4,
+    // A usable data link but a DEAD feedback link: no ACK ever returns, so the
+    // sender can never confirm delivery and — once a packet outlives libsrt's
+    // send-side TLPKTDROP window (max(latency, 1000 ms) + 2·SYN ≈ 1020 ms) — sheds
+    // it and announces the drop via DROPREQ. (A merely-lossy link no longer forces a
+    // drop: the corrected window lets ARQ recover the stragglers rather than
+    // abandoning them at the bare 80 ms playout latency — the point of the fix.)
+    let data = LinkConfig {
+        loss: 0.1,
         ..LinkConfig::PERFECT
     };
-    let starved = LinkConfig {
-        loss: 0.9,
+    let dead_feedback = LinkConfig {
+        loss: 1.0,
         ..LinkConfig::PERFECT
     };
-    let mut pair = connected(lossy, starved, 11);
+    let mut pair = connected(data, dead_feedback, 11);
 
     for i in 0..40u8 {
         pair.caller_send(&[i; 60]);
         pair.run_for(20_000); // 20 ms between packets
     }
-    // Let everything settle: in-flight data drains, drops are announced.
-    pair.run_for(2_000_000);
+    // Settle well past the ~1020 ms drop threshold so the un-acked tail ages out.
+    pair.run_for(2_500_000);
 
     // The sender shed at least one too-late packet (send-side TLPKTDROP).
     assert!(

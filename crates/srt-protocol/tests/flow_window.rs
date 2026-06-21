@@ -97,9 +97,9 @@ fn send_side_drops_are_counted_in_stats() {
     for i in 0..10u8 {
         pair.caller_send(&[i; 100]);
     }
-    // Run past the 50 ms latency budget and the 300 ms EXP firing that triggers
-    // the shedding.
-    pair.run_for(1_000_000);
+    // Run well past the send-side TLPKTDROP window (max(latency, 1000 ms) + 2·SYN
+    // ≈ 1020 ms) so an EXP firing after the threshold sheds every un-acked packet.
+    pair.run_for(2_500_000);
 
     let stats = pair.caller_stats();
     assert!(
