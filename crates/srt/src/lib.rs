@@ -18,7 +18,7 @@ use stream::StreamMeta;
 
 pub use error::{Error, Result};
 pub use runtime::{AsyncUdpSocket, Runtime, TokioRuntime};
-pub use srt_protocol::connection::{CipherMode, Config, EncryptionSettings, KeySize};
+pub use srt_protocol::connection::{CipherMode, Config, EncryptionSettings, FecConfig, KeySize};
 pub use srt_protocol::error::{ConfigError, ConnectionError};
 pub use srt_protocol::handshake::RejectReason;
 pub use srt_protocol::stats::Stats;
